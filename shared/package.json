@@ -1,0 +1,11 @@
+{
+  "name": "@rollarr/shared",
+  "version": "1.0.0",
+  "main": "src/types.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
