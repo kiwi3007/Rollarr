@@ -65,19 +65,23 @@ export const plexService = {
     return data.MediaContainer.Metadata ?? [];
   },
 
-  // Find a show's ratingKey by scanning the TV section using tvdbId from Plex's guid
-  async findShowRatingKey(tvdbId: number): Promise<string | undefined> {
+  // Find a show's ratingKey by scanning the TV section.
+  // Primary: TVDB GUID match (modern or legacy agent).
+  // Fallback: title match — handles streaming shows (Netflix, etc.) where Plex
+  // resolves via TMDB and has no tvdb:// GUID entry.
+  async findShowRatingKey(tvdbId: number, fallbackTitle?: string): Promise<string | undefined> {
     const base = getPlexUrl();
-    // First get library sections to find TV library key
     const sectionsData = await plexFetch<{
       MediaContainer: { Directory: Array<{ key: string; type: string }> };
     }>(`${base}/library/sections`);
 
     const tvSections = sectionsData.MediaContainer.Directory.filter((d) => d.type === 'show');
 
+    let titleMatch: string | undefined;
+
     for (const section of tvSections) {
       const showsData = await plexFetch<{
-        MediaContainer: { Metadata?: Array<{ ratingKey: string; guid: string; Guid?: Array<{ id: string }> }> };
+        MediaContainer: { Metadata?: Array<{ ratingKey: string; title: string; guid: string; Guid?: Array<{ id: string }> }> };
       }>(`${base}/library/sections/${section.key}/all?type=2&includeGuids=1`);
 
       const shows = showsData.MediaContainer.Metadata ?? [];
@@ -89,9 +93,17 @@ export const plexService = {
         if (modernMatch || legacyMatch) {
           return show.ratingKey;
         }
+        if (fallbackTitle && !titleMatch &&
+            show.title?.toLowerCase() === fallbackTitle.toLowerCase()) {
+          titleMatch = show.ratingKey;
+        }
       }
     }
-    return undefined;
+
+    if (titleMatch) {
+      logger.info(`findShowRatingKey: no TVDB GUID for tvdbId=${tvdbId}, matched by title "${fallbackTitle}"`);
+    }
+    return titleMatch;
   },
 
   // Returns seasons for a show ratingKey
@@ -276,6 +288,14 @@ export const plexService = {
     } finally {
       plexDb?.close();
     }
+  },
+
+  // Plex's local HTTP history API returns accountID=1 for the server admin when they
+  // play without cloud auth. Translate to the known cloud ID so all consumers use a
+  // single consistent identity for the admin account.
+  normalizeAccountId(id: number): number {
+    if (id === 1 && adminAccountId !== undefined) return adminAccountId;
+    return id;
   },
 
   // Resolve a Seerr-provided name to a Plex accountId.

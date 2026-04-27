@@ -40,40 +40,34 @@ export const rollingWindowService = {
     // updated independently. Using admin viewCount (getEpisodesForSeason) would only
     // reflect what the admin has watched, not other users.
     let historyBySeason: Map<number, Map<number, number>>;  // accountId → season → highest episode watched
-    let liveFileIds = new Map<number, number>();   // sonarr_episode_id → file_id, queried fresh each cycle
     // Hoisted so Phase 2 rewatch filtering can access raw entries and showKey.
     let showHistory:   PlexHistoryEntry[] = [];
     let globalHistory: PlexHistoryEntry[] = [];
     let showKey = '';
     try {
-      const plexRatingKey = await plexService.findShowRatingKey(show.tvdb_id);
+      const plexRatingKey = await plexService.findShowRatingKey(show.tvdb_id, show.title);
       if (!plexRatingKey) {
         logger.warn(`Show ${show.title}: no Plex ratingKey found — skipping window advance`);
         return { success: false, advanced: 0, reason: 'Plex show not found' };
       }
       showKey = `/library/metadata/${plexRatingKey}`;
 
-      // Fetch Plex history, admin viewCounts, and Sonarr episode data in parallel.
-      // File IDs come from Sonarr live — no caching in DB avoids stale-null deletions.
-      // Two history sources run in parallel:
-      //   - Per-show history: all plays for the current ratingKey, no volume cap
-      //   - Global history: catches plays made when the show had a different ratingKey
-      //     (re-added show gets a new ratingKey; old plays only findable by title match)
-      [showHistory, globalHistory] = await Promise.all([
+      // Fetch Plex history and admin viewCounts in parallel.
+      // Sonarr episode data (live file IDs) is deferred until Phase 3 — only fetched
+      // when the DB pre-check shows episodes actually need to be deleted or monitored.
+      const [sh, gh, adminEps] = await Promise.all([
         plexService.getShowHistory(plexRatingKey).catch((err) => {
           logger.warn(`Show ${show.title}: show history failed — ${err instanceof Error ? err.message : String(err)}`);
           return [] as PlexHistoryEntry[];
         }),
         plexService.getGlobalHistory(5000).catch(() => [] as PlexHistoryEntry[]),
-      ]);
-      const [adminEps, sonarrEps] = await Promise.all([
         plexService.getEpisodesForSeason(plexRatingKey, show.current_season).catch((err) => {
           logger.warn(`Show ${show.title}: failed to fetch admin season episodes — ${err instanceof Error ? err.message : String(err)}`);
           return [];
         }),
-        sonarrService.getEpisodes(show.sonarr_id, show.current_season).catch(() => []),
       ]);
-      liveFileIds = new Map(sonarrEps.filter(e => e.hasFile).map(e => [e.id, e.episodeFileId]));
+      showHistory = sh;
+      globalHistory = gh;
 
       // Merge both history sources. Per-show entries need no grandparent check.
       // Global entries use key/title matching to scope to this show and catch old ratingKeys.
@@ -82,8 +76,9 @@ export const rollingWindowService = {
 
       const mergeEntry = (entry: PlexHistoryEntry) => {
         historyMatchCount++;
-        let seasons = historyBySeason.get(entry.accountID);
-        if (!seasons) { seasons = new Map(); historyBySeason.set(entry.accountID, seasons); }
+        const accountId = plexService.normalizeAccountId(entry.accountID);
+        let seasons = historyBySeason.get(accountId);
+        if (!seasons) { seasons = new Map(); historyBySeason.set(accountId, seasons); }
         const prev = seasons.get(entry.parentIndex) ?? 0;
         if (entry.index > prev) seasons.set(entry.parentIndex, entry.index);
       };
@@ -166,12 +161,12 @@ export const rollingWindowService = {
         const sinceUnix = Math.floor(new Date(tracker.rewatch_since).getTime() / 1000);
         const rewatchSeasons = new Map<number, number>();
         for (const entry of showHistory) {
-          if (entry.accountID !== accountId || entry.viewedAt < sinceUnix) continue;
+          if (plexService.normalizeAccountId(entry.accountID) !== accountId || entry.viewedAt < sinceUnix) continue;
           const prev = rewatchSeasons.get(entry.parentIndex) ?? 0;
           if (entry.index > prev) rewatchSeasons.set(entry.parentIndex, entry.index);
         }
         for (const entry of globalHistory) {
-          if (entry.accountID !== accountId || entry.viewedAt < sinceUnix) continue;
+          if (plexService.normalizeAccountId(entry.accountID) !== accountId || entry.viewedAt < sinceUnix) continue;
           const keyMatch   = entry.grandparentKey === showKey;
           const titleMatch = entry.grandparentTitle?.toLowerCase() === show.title.toLowerCase();
           if (!keyMatch && !titleMatch) continue;
@@ -205,6 +200,9 @@ export const rollingWindowService = {
 
     // Reload trackers after progress update
     const updatedTrackers = trackerRepository.findActiveByShow(showId);
+    if (updatedTrackers.length === 0) {
+      return { success: true, advanced: 0 };
+    }
     // Treat trackers on a previous season as having watched 0 episodes of the current season.
     const effectiveEp = (t: typeof updatedTrackers[0]) =>
       t.last_watched_season === show.current_season ? t.last_watched_episode : 0;
@@ -223,9 +221,27 @@ export const rollingWindowService = {
       }
     }
 
-    // Episodes to delete: not in the keep window AND (monitored in Sonarr OR Sonarr still has the file).
-    // Using liveFileIds (queried fresh above) catches episodes that were previously skipped because
-    // sonarr_file_id was null in our DB at the time they left the window.
+    // DB-only pre-check: skip the Sonarr getEpisodes call entirely when nothing has changed.
+    // Monitored episodes leaving the window and Unmonitored episodes entering it are both
+    // visible from DB status alone. Re-downloaded Deleted episodes (the liveFileIds safety net)
+    // are only worth checking when the window is already moving.
+    const dbNeedsDelete  = dbEpisodes.some(ep => !keepEpNumbers.has(ep.episode_number) && ep.status === EpisodeStatus.Monitored);
+    const dbNeedsMonitor = dbEpisodes.some(ep =>  keepEpNumbers.has(ep.episode_number) && ep.status === EpisodeStatus.Unmonitored);
+
+    if (!dbNeedsDelete && !dbNeedsMonitor) {
+      return { success: true, advanced: 0 };
+    }
+
+    // Fetch live file IDs only when we know there's work to do.
+    // Catches re-downloaded Deleted episodes that left the window before a file existed.
+    let liveFileIds = new Map<number, number>();
+    try {
+      const sonarrEps = await sonarrService.getEpisodes(show.sonarr_id, show.current_season);
+      liveFileIds = new Map(sonarrEps.filter(e => e.hasFile).map(e => [e.id, e.episodeFileId]));
+    } catch {
+      // Non-fatal: proceed without live file IDs; re-downloaded Deleted eps won't be caught this cycle
+    }
+
     const toDelete = dbEpisodes.filter(
       (ep) =>
         !keepEpNumbers.has(ep.episode_number) &&
@@ -241,31 +257,33 @@ export const rollingWindowService = {
       return { success: true, advanced: 0 };
     }
 
-    // --- Phase 3: Sonarr operations (async, before transaction) ---
-    const sonarrOps: Array<() => Promise<void>> = [];
+    // --- Phase 3: Sonarr operations ---
     const dryMode = isDryMode();
 
+    // File deletes are independent — run in parallel. Monitor/search must be sequential
+    // (search after monitor so Sonarr picks up the newly-watched episode list correctly).
+    const fileDeleteOps: Array<Promise<void>> = [];
     for (const ep of toDelete) {
       const fileId = liveFileIds.get(ep.sonarr_episode_id);
       if (fileId) {
         if (dryMode) {
           logger.info(`[DRY MODE] Would delete file ${fileId} for S${show.current_season}E${ep.episode_number} of "${show.title}"`);
         } else {
-          sonarrOps.push(() => sonarrService.deleteEpisodeFile(fileId));
+          fileDeleteOps.push(sonarrService.deleteEpisodeFile(fileId));
         }
       }
-      sonarrOps.push(() => sonarrService.setEpisodesMonitored([ep.sonarr_episode_id], false));
-    }
-
-    if (toMonitor.length > 0) {
-      const monitorIds = toMonitor.map((ep) => ep.sonarr_episode_id);
-      sonarrOps.push(() => sonarrService.setEpisodesMonitored(monitorIds, true));
-      sonarrOps.push(() => sonarrService.episodeSearch(monitorIds));
     }
 
     try {
-      for (const op of sonarrOps) {
-        await op();
+      await Promise.all(fileDeleteOps);
+      if (toDelete.length > 0) {
+        const deleteIds = toDelete.map((ep) => ep.sonarr_episode_id);
+        await sonarrService.setEpisodesMonitored(deleteIds, false);
+      }
+      if (toMonitor.length > 0) {
+        const monitorIds = toMonitor.map((ep) => ep.sonarr_episode_id);
+        await sonarrService.setEpisodesMonitored(monitorIds, true);
+        await sonarrService.episodeSearch(monitorIds);
       }
     } catch (err) {
       if (err instanceof SonarrError) {

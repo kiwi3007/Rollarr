@@ -29,8 +29,8 @@ export const showRepository = {
   insert(show: Omit<ShowRow, 'id' | 'created_at' | 'updated_at'>): ShowRow {
     const result = db
       .prepare(
-        `INSERT INTO shows (sonarr_id, title, tvdb_id, status, buffer_size, current_window_start, current_season)
-         VALUES (@sonarr_id, @title, @tvdb_id, @status, @buffer_size, @current_window_start, @current_season)`
+        `INSERT INTO shows (sonarr_id, title, tvdb_id, status, buffer_size, current_window_start, current_season, poster_url, backdrop_url)
+         VALUES (@sonarr_id, @title, @tvdb_id, @status, @buffer_size, @current_window_start, @current_season, @poster_url, @backdrop_url)`
       )
       .run(show);
     return this.findById(result.lastInsertRowid as number)!;
@@ -38,7 +38,7 @@ export const showRepository = {
 
   update(
     id: number,
-    fields: Partial<Pick<ShowRow, 'sonarr_id' | 'status' | 'buffer_size' | 'current_window_start' | 'current_season'>>
+    fields: Partial<Pick<ShowRow, 'sonarr_id' | 'status' | 'buffer_size' | 'current_window_start' | 'current_season' | 'poster_url' | 'backdrop_url'>>
   ): void {
     const setClauses = Object.keys(fields)
       .map((k) => `${k} = @${k}`)

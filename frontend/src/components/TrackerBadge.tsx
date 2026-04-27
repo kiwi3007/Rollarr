@@ -1,4 +1,3 @@
-import { User } from 'lucide-react';
 import type { TrackerWithUser } from '../api/client';
 
 interface TrackerBadgeProps {
@@ -11,18 +10,26 @@ export function TrackerBadge({ tracker }: TrackerBadgeProps) {
     : 'not started';
 
   return (
-    <div
-      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs"
+    <span
       style={{
-        background: tracker.is_active ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.05)',
-        border: `1px solid ${tracker.is_active ? 'rgba(16,185,129,0.25)' : 'rgba(255,255,255,0.08)'}`,
-        color: tracker.is_active ? '#a7f3d0' : 'rgba(255,255,255,0.4)',
+        display: 'inline-flex', alignItems: 'center', gap: 6,
+        padding: '3px 10px', borderRadius: 'var(--radius-pill)',
+        background: tracker.is_active ? 'rgba(249,115,22,0.1)' : 'var(--color-glass-bg-light)',
+        border: `1px solid ${tracker.is_active ? 'rgba(249,115,22,0.25)' : 'var(--color-glass-border)'}`,
+        fontSize: '0.72rem', fontWeight: 600,
+        color: tracker.is_active ? 'var(--color-accent-orange)' : 'var(--color-text-muted)',
       }}
     >
-      <User size={10} />
-      <span className="font-medium">{tracker.plex_username}</span>
-      <span className="mono opacity-60">·</span>
-      <span className="mono opacity-70">{lastSeen}</span>
-    </div>
+      <span style={{
+        width: 18, height: 18, borderRadius: '50%',
+        background: tracker.is_active ? 'rgba(249,115,22,0.2)' : 'var(--color-glass-bg-light)',
+        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: '0.55rem', fontWeight: 800,
+      }}>
+        {tracker.plex_username.charAt(0).toUpperCase()}
+      </span>
+      {tracker.plex_username}
+      <span style={{ color: 'var(--color-text-muted)', fontVariantNumeric: 'tabular-nums' }}>· {lastSeen}</span>
+    </span>
   );
 }

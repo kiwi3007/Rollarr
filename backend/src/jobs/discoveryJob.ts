@@ -58,19 +58,29 @@ async function setupSonarrBuffer(
 ): Promise<boolean> {
   const title = sonarrSeries.title;
 
-  let s01Episodes;
-  try {
-    s01Episodes = await sonarrService.getEpisodes(sonarrSeries.id, 1);
-  } catch (err) {
-    if (err instanceof SonarrError) {
-      logger.error(`Failed to get S01 episodes for ${title}`, err.message);
-      return false;
+  // Sonarr populates episode metadata asynchronously after series add — retry until
+  // the list is non-empty. Delays match the TVDB refresh window (typically 3–10s).
+  let s01Episodes: import('@rollarr/shared').SonarrEpisode[] = [];
+  const EP_RETRY_DELAYS = [3_000, 5_000, 8_000, 12_000];
+  for (let attempt = 0; attempt <= EP_RETRY_DELAYS.length; attempt++) {
+    try {
+      s01Episodes = await sonarrService.getEpisodes(sonarrSeries.id, 1);
+    } catch (err) {
+      if (err instanceof SonarrError) {
+        logger.error(`Failed to get S01 episodes for ${title}`, err.message);
+        return false;
+      }
+      throw err;
     }
-    throw err;
+    if (s01Episodes.length > 0) break;
+    if (attempt < EP_RETRY_DELAYS.length) {
+      logger.info(`${title}: S01 episode list empty (attempt ${attempt + 1}/${EP_RETRY_DELAYS.length + 1}), retrying in ${EP_RETRY_DELAYS[attempt]}ms`);
+      await new Promise((r) => setTimeout(r, EP_RETRY_DELAYS[attempt]));
+    }
   }
 
   if (s01Episodes.length === 0) {
-    logger.warn(`No S01 episodes found for ${title}`);
+    logger.warn(`No S01 episodes found for ${title} after ${EP_RETRY_DELAYS.length + 1} attempts`);
     return false;
   }
 
@@ -184,6 +194,8 @@ async function bootstrapNewShow(
       buffer_size:          bufferSize,
       current_window_start: lastWatched + 1,
       current_season:       1,
+      poster_url:   sonarrSeries.images?.find((i) => i.coverType === 'poster')?.remoteUrl ?? null,
+      backdrop_url: sonarrSeries.images?.find((i) => i.coverType === 'fanart')?.remoteUrl ?? null,
     });
     showId = show.id;
   })();
@@ -234,7 +246,7 @@ export async function runDiscoveryJob(): Promise<void> {
     );
     if (!managed) continue;
 
-    const accountId = String(play.accountID);
+    const accountId = String(plexService.normalizeAccountId(play.accountID));
     const key = `${managed.id}:${accountId}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -267,42 +279,76 @@ export async function triggerForTvdbId(tvdbId: number, plexUsername?: string): P
     return;
   }
 
+  // Resolve accountId early (synchronous) so history can be scoped to the requesting user.
+  // Buffer start must reflect WHERE THIS USER is, not a different user's (e.g. admin's) progress.
+  const earlyAccountId = plexUsername ? plexService.resolveAccountId(plexUsername) : undefined;
+
   // Check Plex for existing watch progress so the buffer starts at the right episode.
-  // Uses three sources in priority order: allLeaves viewCount (covers episodes whose files
-  // are gone but whose Plex metadata survived), targeted show history (covers plays for
-  // episodes Plex has fully cleaned up), then falls back to 0 for brand-new requests.
+  // When a requesting user is known, use their history specifically — avoids bootstrapping
+  // the buffer past episodes they haven't watched yet just because another user (e.g. admin)
+  // is further ahead.
   let lastWatched = 0;
   let isFullRewatch = false;
   let plexKey: string | undefined;
+  let showHistory: import('@rollarr/shared').PlexHistoryEntry[] = [];
   try {
-    plexKey = await plexService.findShowRatingKey(tvdbId);
+    plexKey = await plexService.findShowRatingKey(tvdbId, sonarrSeries.title);
     if (plexKey) {
-      // Source 1: allLeaves viewCount — comprehensive, includes unavailable episodes
-      const allEps = await plexService.getAllEpisodes(plexKey);
-      for (const ep of allEps) {
-        if (ep.parentIndex === 1 && (ep.viewCount ?? 0) > 0 && ep.index > lastWatched) {
-          lastWatched = ep.index;
-        }
-      }
-      logger.debug(`${sonarrSeries.title}: allLeaves viewCount → S1E${lastWatched}`);
+      const [allEps, fetchedHistory] = await Promise.all([
+        plexService.getAllEpisodes(plexKey),
+        plexService.getShowHistory(plexKey),
+      ]);
+      showHistory = fetchedHistory;
 
-      // Source 2: per-show play history — finds plays Plex no longer has metadata for
-      const showHistory = await plexService.getShowHistory(plexKey);
-      for (const entry of showHistory) {
-        if (entry.parentIndex === 1 && entry.index > lastWatched) {
-          lastWatched = entry.index;
+      if (earlyAccountId) {
+        // Per-user: derive lastWatched from this user's play history only
+        const uid = Number(earlyAccountId);
+        for (const entry of showHistory) {
+          if (plexService.normalizeAccountId(entry.accountID) === uid && entry.parentIndex === 1 && entry.index > lastWatched) {
+            lastWatched = entry.index;
+          }
         }
-      }
-      logger.debug(`${sonarrSeries.title}: show history supplement → S1E${lastWatched}`);
+        // Supplement with Plex DB (covers "Mark as Watched")
+        const markedWatched = plexService.getMarkedWatchedFromDb(plexKey);
+        const userDbSeasons = markedWatched.get(uid);
+        if (userDbSeasons) {
+          const s1 = userDbSeasons.get(1) ?? 0;
+          if (s1 > lastWatched) lastWatched = s1;
+        }
+        logger.debug(`${sonarrSeries.title}: ${plexUsername} history → S1E${lastWatched}`);
 
-      // Rewatch detection: if every S1 episode in Plex has been watched, old history
-      // would pollute the buffer. Flag as rewatch and start the buffer at E1.
-      const s1Eps     = allEps.filter(e => e.parentIndex === 1);
-      const s1Watched = s1Eps.filter(e => (e.viewCount ?? 0) > 0).length;
-      if (s1Eps.length > 0 && s1Watched === s1Eps.length) {
-        isFullRewatch = true;
-        logger.info(`${sonarrSeries.title}: all ${s1Eps.length} S1 ep(s) previously watched — rewatch detected, buffer starts at E1`);
-        lastWatched = 0;
+        // Per-user rewatch detection: count unique S1 eps this user has played
+        const s1Total = allEps.filter(e => e.parentIndex === 1).length;
+        const userS1Played = new Set(
+          showHistory.filter(e => plexService.normalizeAccountId(e.accountID) === uid && e.parentIndex === 1).map(e => e.index)
+        ).size;
+        if (s1Total > 0 && userS1Played >= s1Total) {
+          isFullRewatch = true;
+          logger.info(`${sonarrSeries.title}: ${plexUsername} has watched all ${s1Total} S1 ep(s) — rewatch detected, buffer starts at E1`);
+          lastWatched = 0;
+        }
+      } else {
+        // No requesting user — fall back to global max (admin viewCount + all history)
+        for (const ep of allEps) {
+          if (ep.parentIndex === 1 && (ep.viewCount ?? 0) > 0 && ep.index > lastWatched) {
+            lastWatched = ep.index;
+          }
+        }
+        logger.debug(`${sonarrSeries.title}: allLeaves viewCount → S1E${lastWatched}`);
+        for (const entry of showHistory) {
+          if (entry.parentIndex === 1 && entry.index > lastWatched) {
+            lastWatched = entry.index;
+          }
+        }
+        logger.debug(`${sonarrSeries.title}: global history max → S1E${lastWatched}`);
+
+        const s1Eps     = allEps.filter(e => e.parentIndex === 1);
+        const s1Watched = s1Eps.filter(e => (e.viewCount ?? 0) > 0).length;
+        if (s1Eps.length > 0 && s1Watched === s1Eps.length) {
+          isFullRewatch = true;
+          logger.info(`${sonarrSeries.title}: all ${s1Eps.length} S1 ep(s) previously watched — rewatch detected, buffer starts at E1`);
+          lastWatched = 0;
+        }
       }
     }
   } catch {
@@ -321,7 +367,12 @@ export async function triggerForTvdbId(tvdbId: number, plexUsername?: string): P
   } else {
     showId = existing.id;
     logger.info(`Reactivating existing show "${sonarrSeries.title}" (was ${existing.status})`);
-    showRepository.update(showId, { sonarr_id: sonarrSeries.id, status: ShowStatus.Active });
+    showRepository.update(showId, {
+      sonarr_id:    sonarrSeries.id,
+      status:       ShowStatus.Active,
+      poster_url:   sonarrSeries.images?.find((i) => i.coverType === 'poster')?.remoteUrl ?? null,
+      backdrop_url: sonarrSeries.images?.find((i) => i.coverType === 'fanart')?.remoteUrl ?? null,
+    });
     // Re-run Sonarr setup — Seerr will have re-monitored everything on re-request
     await setupSonarrBuffer(sonarrSeries, showId, bufferSize, lastWatched);
   }
@@ -336,7 +387,41 @@ export async function triggerForTvdbId(tvdbId: number, plexUsername?: string): P
       logger.warn(`Webhook: ${plexUsername} not in Plex user map — synthetic record created, will upgrade on first history poll`);
     }
     const rewatchSince = isFullRewatch ? new Date().toISOString() : undefined;
-    trackerRepository.upsert(showId, user.id, rewatchSince);
+
+    // Derive this user's initial watched position directly from the show history already
+    // fetched above — avoids relying on advanceWindow's global-history cap (5000 entries)
+    // to backfill progress for plays that may have aged out of the global window.
+    let userLastEp     = 0;
+    let userLastSeason = 1;
+    if (!isFullRewatch && realAccountId) {
+      const uid = Number(realAccountId);
+      for (const entry of showHistory) {
+        if (plexService.normalizeAccountId(entry.accountID) !== uid) continue;
+        if (entry.parentIndex > userLastSeason ||
+            (entry.parentIndex === userLastSeason && entry.index > userLastEp)) {
+          userLastSeason = entry.parentIndex;
+          userLastEp     = entry.index;
+        }
+      }
+      // Also check Plex DB (covers "Mark as Watched" which doesn't appear in play history)
+      if (plexKey) {
+        const markedWatched = plexService.getMarkedWatchedFromDb(plexKey);
+        const userDbSeasons = markedWatched.get(uid);
+        if (userDbSeasons) {
+          for (const [season, ep] of userDbSeasons) {
+            if (season > userLastSeason || (season === userLastSeason && ep > userLastEp)) {
+              userLastSeason = season;
+              userLastEp     = ep;
+            }
+          }
+        }
+      }
+      if (userLastEp > 0) {
+        logger.info(`Webhook: ${plexUsername} watch history → S${userLastSeason}E${userLastEp} (used as initial tracker position)`);
+      }
+    }
+
+    trackerRepository.upsert(showId, user.id, rewatchSince, userLastEp, userLastSeason);
     logger.info(`Webhook: tracker created ${plexUsername} → ${sonarrSeries.title}${isFullRewatch ? ' (rewatch)' : ''}`);
   }
 

@@ -81,4 +81,14 @@ export const episodeRepository = {
       .get(showId, season) as { n: number };
     return row.n;
   },
+
+  getSeasonSummary(showId: number): { season: number; total_episodes: number }[] {
+    return db
+      .prepare(
+        `SELECT season, COUNT(*) as total_episodes
+         FROM episodes WHERE show_id = ?
+         GROUP BY season ORDER BY season`
+      )
+      .all(showId) as { season: number; total_episodes: number }[];
+  },
 };

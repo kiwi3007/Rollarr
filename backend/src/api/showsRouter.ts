@@ -12,6 +12,8 @@ showsRouter.get('/', (_req, res) => {
   const data = shows.map((show) => ({
     ...show,
     trackerCount: trackerRepository.countActive(show.id),
+    trackers: trackerRepository.findActiveByShow(show.id),
+    season_data: episodeRepository.getSeasonSummary(show.id),
   }));
   res.json({ data });
 });
@@ -28,6 +30,7 @@ showsRouter.get('/:id', (req, res) => {
       ...show,
       trackers: trackerRepository.findByShow(id),
       episodes: episodeRepository.findByShow(id),
+      season_data: episodeRepository.getSeasonSummary(id),
     },
   });
 });

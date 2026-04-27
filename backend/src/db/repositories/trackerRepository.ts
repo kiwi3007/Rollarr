@@ -3,13 +3,14 @@ import type { TrackerRow } from '@rollarr/shared';
 
 export interface TrackerWithUser extends TrackerRow {
   plex_username: string;
+  last_activity: string;
 }
 
 export const trackerRepository = {
   findByShow(showId: number): TrackerWithUser[] {
     return db
       .prepare(
-        `SELECT t.*, u.plex_username
+        `SELECT t.*, u.plex_username, u.last_active_at as last_activity
          FROM trackers t
          JOIN users u ON u.id = t.user_id
          WHERE t.show_id = ?`
@@ -20,7 +21,7 @@ export const trackerRepository = {
   findActiveByShow(showId: number): TrackerWithUser[] {
     return db
       .prepare(
-        `SELECT t.*, u.plex_username
+        `SELECT t.*, u.plex_username, u.last_active_at as last_activity
          FROM trackers t
          JOIN users u ON u.id = t.user_id
          WHERE t.show_id = ? AND t.is_active = 1`
@@ -34,15 +35,21 @@ export const trackerRepository = {
       .get(showId, userId) as TrackerRow | undefined;
   },
 
-  upsert(showId: number, userId: number, rewatchSince?: string): TrackerRow {
+  upsert(
+    showId: number,
+    userId: number,
+    rewatchSince?: string,
+    initialEpisode?: number,
+    initialSeason?: number,
+  ): TrackerRow {
     db.prepare(
-      `INSERT INTO trackers (show_id, user_id, rewatch_since)
-       VALUES (?, ?, ?)
+      `INSERT INTO trackers (show_id, user_id, rewatch_since, last_watched_episode, last_watched_season)
+       VALUES (?, ?, ?, ?, ?)
        ON CONFLICT(show_id, user_id) DO UPDATE SET
          is_active = 1,
          watchlist_active = 1,
          rewatch_since = COALESCE(excluded.rewatch_since, rewatch_since)`
-    ).run(showId, userId, rewatchSince ?? null);
+    ).run(showId, userId, rewatchSince ?? null, initialEpisode ?? 0, initialSeason ?? 1);
     return this.findByShowAndUser(showId, userId)!;
   },
 

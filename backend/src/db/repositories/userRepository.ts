@@ -17,17 +17,26 @@ export const userRepository = {
   },
 
   upsert(plexAccountId: string, plexUsername: string): UserRow {
-    // If a synthetic record exists for this username, upgrade it with the real account ID
-    db.prepare(
-      `UPDATE users SET plex_account_id = ?, plex_username = ?
-       WHERE plex_account_id = ? AND plex_account_id LIKE 'seerr:%'`
-    ).run(plexAccountId, plexUsername, `seerr:${plexUsername}`);
+    db.transaction(() => {
+      // Only upgrade synthetic placeholder if no real record already exists for this accountId.
+      // Without the guard, if both rows exist the UPDATE changes the synthetic's plex_account_id
+      // to the real one, then the INSERT hits a UNIQUE conflict on that same value.
+      const realExists = db
+        .prepare(`SELECT id FROM users WHERE plex_account_id = ?`)
+        .get(plexAccountId);
+      if (!realExists) {
+        db.prepare(
+          `UPDATE users SET plex_account_id = ?, plex_username = ?
+           WHERE plex_account_id = ? AND plex_account_id LIKE 'seerr:%'`
+        ).run(plexAccountId, plexUsername, `seerr:${plexUsername}`);
+      }
 
-    db.prepare(
-      `INSERT INTO users (plex_account_id, plex_username)
-       VALUES (?, ?)
-       ON CONFLICT(plex_account_id) DO UPDATE SET plex_username = excluded.plex_username`
-    ).run(plexAccountId, plexUsername);
+      db.prepare(
+        `INSERT INTO users (plex_account_id, plex_username)
+         VALUES (?, ?)
+         ON CONFLICT(plex_account_id) DO UPDATE SET plex_username = excluded.plex_username`
+      ).run(plexAccountId, plexUsername);
+    })();
     return this.findByPlexAccountId(plexAccountId)!;
   },
 

@@ -1,7 +1,8 @@
 {
   "name": "@rollarr/shared",
   "version": "1.0.0",
-  "main": "src/types.ts",
+  "main": "dist/types.js",
+  "types": "dist/types.d.ts",
   "scripts": {
     "build": "tsc"
   },

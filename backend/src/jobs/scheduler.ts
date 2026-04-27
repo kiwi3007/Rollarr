@@ -9,8 +9,9 @@ import { createLogger } from '../utils/logger';
 const logger = createLogger('scheduler');
 
 function minutesToCron(minutes: number): string {
-  if (minutes < 60) return `*/${minutes} * * * *`;
-  const hours = Math.floor(minutes / 60);
+  const m = Math.max(1, minutes);
+  if (m < 60) return `*/${m} * * * *`;
+  const hours = Math.floor(m / 60);
   return `0 */${hours} * * *`;
 }
 

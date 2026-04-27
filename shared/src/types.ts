@@ -25,6 +25,8 @@ export interface ShowRow {
   buffer_size:          number;
   current_window_start: number;
   current_season:       number;
+  poster_url:           string | null;
+  backdrop_url:         string | null;
   created_at:           string;
   updated_at:           string;
 }
@@ -71,6 +73,7 @@ export interface SonarrSeries {
   tvdbId:   number;
   seasons:  SonarrSeason[];
   status:   string;
+  images?:  Array<{ coverType: string; url: string; remoteUrl?: string }>;
 }
 
 export interface SonarrSeason {

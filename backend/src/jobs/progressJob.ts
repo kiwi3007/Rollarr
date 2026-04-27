@@ -14,6 +14,14 @@ export async function runProgressJob(): Promise<void> {
 
   for (const show of activeShows) {
     try {
+      // Snapshot progress before advancing so we can detect actual changes
+      const beforeProgress = new Map(
+        trackerRepository.findActiveByShow(show.id).map((t) => [
+          t.user_id,
+          { ep: t.last_watched_episode, season: t.last_watched_season },
+        ])
+      );
+
       // Advance rolling window
       const result = await rollingWindowService.advanceWindow(show.id);
       if (result.advanced > 0) {
@@ -23,10 +31,12 @@ export async function runProgressJob(): Promise<void> {
       // Check if we should start next season
       await rollingWindowService.checkSeasonTransition(show.id);
 
-      // Update last_active_at for all users who have been watching
-      const trackers = trackerRepository.findActiveByShow(show.id);
-      for (const tracker of trackers) {
-        if (tracker.last_watched_episode > 0) {
+      // Only update last_active_at for trackers whose progress actually advanced
+      const afterTrackers = trackerRepository.findActiveByShow(show.id);
+      for (const tracker of afterTrackers) {
+        const before = beforeProgress.get(tracker.user_id);
+        if (!before) continue;
+        if (tracker.last_watched_episode > before.ep || tracker.last_watched_season > before.season) {
           userRepository.updateLastActive(tracker.user_id);
         }
       }

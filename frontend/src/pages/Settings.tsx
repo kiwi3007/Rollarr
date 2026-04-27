@@ -15,46 +15,37 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
   {
     title: 'Sonarr',
     fields: [
-      { key: 'sonarr_url',     label: 'Sonarr URL',     placeholder: 'http://sonarr:8989', type: 'text' },
-      { key: 'sonarr_api_key', label: 'API Key',         type: 'password' },
+      { key: 'sonarr_url',     label: 'Sonarr URL',  placeholder: 'http://sonarr:8989', type: 'text' },
+      { key: 'sonarr_api_key', label: 'API Key',      type: 'password' },
     ],
   },
   {
     title: 'Plex',
     fields: [
-      { key: 'plex_url',   label: 'Plex URL',   placeholder: 'http://plex:32400', type: 'text' },
-      { key: 'plex_token', label: 'Plex Token', type: 'password', hint: 'Admin token — covers all user types' },
-      {
-        key: 'plex_db_path',
-        label: 'Plex Database Path',
-        placeholder: '/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db',
-        type: 'text',
-        hint: 'Optional: path to Plex SQLite DB. Enables "Mark as Watched" tracking for all users including remote friends.',
-      },
+      { key: 'plex_url',    label: 'Plex URL',            placeholder: 'http://plex:32400', type: 'text' },
+      { key: 'plex_token',  label: 'Plex Token',          type: 'password', hint: 'Admin token — covers all user types' },
+      { key: 'plex_db_path', label: 'Plex Database Path', placeholder: '/var/lib/plexmediaserver/…', type: 'text',
+        hint: 'Optional: path to Plex SQLite DB. Enables "Mark as Watched" tracking for all users including remote friends.' },
     ],
   },
   {
     title: 'Webhooks',
     fields: [
-      {
-        key: 'seerr_webhook_secret',
-        label: 'Seerr Webhook Secret',
-        type: 'password',
-        hint: 'Set this in Seerr → Notifications → Webhook → Custom header: x-webhook-secret',
-      },
+      { key: 'seerr_webhook_secret', label: 'Seerr Webhook Secret', type: 'password',
+        hint: 'Set this in Seerr → Notifications → Webhook → Custom header: x-webhook-secret' },
     ],
   },
   {
     title: 'Behaviour',
     fields: [
-      { key: 'buffer_size',                  label: 'Buffer Size (episodes)',               type: 'number', hint: 'Episodes kept on disk ahead of each active tracker' },
-      { key: 'starter_buffer_size',          label: 'Starter Buffer (episodes)',            type: 'number', hint: 'Episodes always kept from the start of a show so new watchers can begin immediately' },
-      { key: 'inactivity_warn_days',         label: 'Inactivity Warning (days)',            type: 'number' },
-      { key: 'inactivity_remove_days',       label: 'Inactivity Removal (days)',            type: 'number', hint: 'Tracker removed and files deleted after this many inactive days' },
-      { key: 'poll_interval_minutes',        label: 'Poll Interval (minutes)',              type: 'number', hint: 'Restart required to apply changes' },
-      { key: 'maintenance_interval_minutes', label: 'Maintenance Interval (minutes)',       type: 'number', hint: 'Restart required to apply changes' },
-      { key: 'cancel_queued_downloads', label: 'Cancel Queued Downloads', type: 'toggle', hint: 'Remove episodes outside the buffer from the download queue when a show is bootstrapped.' },
-      { key: 'dry_mode', label: 'Dry Mode', type: 'toggle', hint: 'Log deletions without executing them. Files are never removed while this is on.' },
+      { key: 'buffer_size',                  label: 'Buffer size (episodes)',          type: 'number', hint: 'Episodes kept on disk ahead of each active tracker' },
+      { key: 'starter_buffer_size',          label: 'Starter buffer (episodes)',       type: 'number', hint: 'Episodes always kept from the start of a show so new watchers can begin immediately' },
+      { key: 'inactivity_warn_days',         label: 'Inactivity warning (days)',       type: 'number' },
+      { key: 'inactivity_remove_days',       label: 'Inactivity removal (days)',       type: 'number', hint: 'Tracker removed and files deleted after this many inactive days' },
+      { key: 'poll_interval_minutes',        label: 'Poll interval (minutes)',         type: 'number', hint: 'Restart required to apply changes' },
+      { key: 'maintenance_interval_minutes', label: 'Maintenance interval (minutes)', type: 'number', hint: 'Restart required to apply changes' },
+      { key: 'cancel_queued_downloads', label: 'Cancel queued downloads', type: 'toggle', hint: 'Remove episodes outside the buffer from the download queue when a show is bootstrapped.' },
+      { key: 'dry_mode', label: 'Dry mode', type: 'toggle', hint: 'Log deletions without executing them. Files are never removed while this is on.' },
     ],
   },
 ];
@@ -92,16 +83,19 @@ export function Settings() {
   function toggleReveal(key: string) {
     setRevealed((prev) => {
       const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+      if (next.has(key)) next.delete(key); else next.add(key);
       return next;
     });
   }
 
+  function set(key: string, val: string) {
+    setValues((v) => ({ ...v, [key]: val }));
+  }
+
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-64">
-        <Loader2 size={28} className="animate-spin" style={{ color: 'var(--emerald)' }} />
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 256 }}>
+        <Loader2 size={28} style={{ animation: 'spin 0.8s linear infinite', color: 'var(--color-accent-orange)' }} />
       </div>
     );
   }
@@ -109,67 +103,56 @@ export function Settings() {
   const dryModeActive = values['dry_mode'] === 'true';
 
   return (
-    <form onSubmit={handleSave} className="max-w-2xl space-y-6 fade-up">
+    <form
+      onSubmit={handleSave}
+      className="page-enter"
+      style={{ maxWidth: 640, display: 'flex', flexDirection: 'column', gap: 20 }}
+    >
       <div>
-        <h1 className="text-2xl font-extrabold text-white">Settings</h1>
-        <p className="text-sm mt-1" style={{ color: 'rgba(255,255,255,0.4)' }}>
+        <h1 style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--color-text-primary)' }}>Settings</h1>
+        <p style={{ marginTop: 6, fontSize: '0.875rem', color: 'var(--color-text-muted)' }}>
           Configuration is stored in the database — changes take effect on the next poll.
         </p>
       </div>
 
       {dryModeActive && (
-        <div
-          className="flex items-center gap-3 px-4 py-3 rounded-xl"
-          style={{ background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)' }}
-        >
-          <ShieldAlert size={16} style={{ color: 'var(--amber)', flexShrink: 0 }} />
-          <p className="text-sm font-medium" style={{ color: '#fcd34d' }}>
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px',
+          borderRadius: 'var(--radius-card)',
+          background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)',
+        }}>
+          <ShieldAlert size={16} style={{ color: 'var(--color-accent-amber)', flexShrink: 0 }} />
+          <p style={{ color: '#fcd34d', fontWeight: 600, fontSize: '0.85rem' }}>
             Dry mode is active — no files will be deleted.
           </p>
         </div>
       )}
 
       {FIELD_GROUPS.map((group) => (
-        <div
-          key={group.title}
-          className="rounded-xl overflow-hidden"
-          style={{ background: 'var(--bg-card)', border: '1px solid var(--border)' }}
-        >
-          <div
-            className="px-5 py-3"
-            style={{ borderBottom: '1px solid rgba(255,255,255,0.05)' }}
-          >
-            <h2 className="text-sm font-bold tracking-wider uppercase" style={{ color: 'rgba(255,255,255,0.5)' }}>
-              {group.title}
-            </h2>
+        <div key={group.title} className="settings-group">
+          <div className="settings-group-header">
+            <span className="section-title">{group.title}</span>
           </div>
-          <div className="p-5 space-y-4">
+          <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
             {group.fields.map((field) => {
-              const isToggle = field.type === 'toggle';
-              if (isToggle) {
+              if (field.type === 'toggle') {
                 const isOn = values[field.key] === 'true';
                 return (
-                  <div key={field.key} className="flex items-center justify-between gap-4">
+                  <div key={field.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
                     <div>
-                      <p className="text-sm font-semibold" style={{ color: 'rgba(255,255,255,0.7)' }}>{field.label}</p>
-                      {field.hint && <p className="text-xs mt-0.5" style={{ color: 'rgba(255,255,255,0.3)' }}>{field.hint}</p>}
+                      <div style={{ fontWeight: 600, fontSize: '0.85rem', color: 'var(--color-text-secondary)' }}>{field.label}</div>
+                      {field.hint && <div style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)', marginTop: 2 }}>{field.hint}</div>}
                     </div>
                     <button
                       type="button"
-                      onClick={() => setValues((v) => ({ ...v, [field.key]: isOn ? 'false' : 'true' }))}
-                      className="relative shrink-0 w-11 h-6 rounded-full transition-all duration-200"
+                      className="toggle-track"
+                      onClick={() => set(field.key, isOn ? 'false' : 'true')}
                       style={{
-                        background: isOn ? 'var(--amber)' : 'rgba(255,255,255,0.1)',
-                        boxShadow: isOn ? '0 0 12px rgba(245,158,11,0.4)' : 'none',
+                        background: isOn ? 'var(--color-accent-orange)' : 'rgba(255,255,255,0.1)',
+                        boxShadow: isOn ? '0 0 12px rgba(249,115,22,0.3)' : 'none',
                       }}
                     >
-                      <span
-                        className="absolute top-1 w-4 h-4 rounded-full transition-all duration-200"
-                        style={{
-                          background: 'white',
-                          left: isOn ? '24px' : '4px',
-                        }}
-                      />
+                      <span className="toggle-thumb" style={{ left: isOn ? 24 : 4 }} />
                     </button>
                   </div>
                 );
@@ -177,54 +160,35 @@ export function Settings() {
 
               const isPassword = field.type === 'password';
               const show = revealed.has(field.key);
-              const inputType = isPassword ? (show ? 'text' : 'password') : (field.type ?? 'text');
               return (
                 <div key={field.key}>
-                  <label
-                    htmlFor={field.key}
-                    className="block text-sm font-semibold mb-1.5"
-                    style={{ color: 'rgba(255,255,255,0.7)' }}
-                  >
+                  <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: 6, color: 'var(--color-text-secondary)' }}>
                     {field.label}
                   </label>
-                  <div className="relative">
+                  <div style={{ position: 'relative' }}>
                     <input
-                      id={field.key}
-                      type={inputType}
+                      type={isPassword ? (show ? 'text' : 'password') : (field.type ?? 'text')}
                       value={values[field.key] ?? ''}
-                      onChange={(e) => setValues((v) => ({ ...v, [field.key]: e.target.value }))}
+                      onChange={(e) => set(field.key, e.target.value)}
                       placeholder={field.placeholder}
-                      className="w-full rounded-lg px-4 py-2.5 text-sm mono outline-none transition-all"
-                      style={{
-                        background: 'rgba(255,255,255,0.04)',
-                        border: '1px solid rgba(255,255,255,0.08)',
-                        color: '#e8e8f0',
-                      }}
-                      onFocus={(e) => {
-                        (e.target as HTMLInputElement).style.borderColor = 'rgba(16,185,129,0.4)';
-                        (e.target as HTMLInputElement).style.boxShadow = '0 0 0 3px rgba(16,185,129,0.06)';
-                      }}
-                      onBlur={(e) => {
-                        (e.target as HTMLInputElement).style.borderColor = 'rgba(255,255,255,0.08)';
-                        (e.target as HTMLInputElement).style.boxShadow = '';
-                      }}
+                      className="glass-input"
+                      style={{ paddingRight: isPassword ? 40 : 14 }}
                     />
                     {isPassword && (
                       <button
                         type="button"
                         onClick={() => toggleReveal(field.key)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2"
-                        style={{ color: 'rgba(255,255,255,0.3)' }}
+                        style={{
+                          position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)',
+                          background: 'none', border: 'none', cursor: 'pointer',
+                          color: 'var(--color-text-muted)', padding: 2,
+                        }}
                       >
                         {show ? <EyeOff size={14} /> : <Eye size={14} />}
                       </button>
                     )}
                   </div>
-                  {field.hint && (
-                    <p className="text-xs mt-1.5" style={{ color: 'rgba(255,255,255,0.3)' }}>
-                      {field.hint}
-                    </p>
-                  )}
+                  {field.hint && <div style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)', marginTop: 5 }}>{field.hint}</div>}
                 </div>
               );
             })}
@@ -233,31 +197,41 @@ export function Settings() {
       ))}
 
       {error && (
-        <div
-          className="flex items-center gap-2 p-4 rounded-xl text-sm"
-          style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)', color: '#fca5a5' }}
-        >
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px',
+          borderRadius: 'var(--radius-card)',
+          background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.2)',
+          color: '#fca5a5', fontSize: '0.875rem',
+        }}>
           <AlertCircle size={16} />
           {error}
         </div>
       )}
 
-      <div className="flex items-center gap-4">
+      <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
         <button
           type="submit"
           disabled={saving}
-          className="flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-bold transition-all"
           style={{
-            background: saved ? 'rgba(16,185,129,0.2)' : 'rgba(16,185,129,0.15)',
-            border: `1px solid ${saved ? 'rgba(16,185,129,0.5)' : 'rgba(16,185,129,0.3)'}`,
-            color: '#6ee7b7',
+            display: 'inline-flex', alignItems: 'center', gap: 6,
+            padding: '0 20px', height: 36, borderRadius: 'var(--radius-pill)',
+            border: 'none', cursor: saving ? 'not-allowed' : 'pointer',
+            background: saved ? 'var(--color-accent-green)' : 'var(--color-accent-orange)',
+            color: '#fff', fontWeight: 600, fontSize: '0.875rem',
+            opacity: saving ? 0.7 : 1,
+            boxShadow: saved ? '0 2px 12px rgba(34,197,94,0.25)' : '0 2px 12px rgba(249,115,22,0.25)',
+            transition: 'all 0.18s',
           }}
         >
-          {saving ? <Loader2 size={14} className="animate-spin" /> : saved ? <CheckCircle size={14} /> : <Save size={14} />}
-          {saving ? 'Saving…' : saved ? 'Saved!' : 'Save Settings'}
+          {saving
+            ? <><Loader2 size={14} style={{ animation: 'spin 0.8s linear infinite' }} /> Saving…</>
+            : saved
+            ? <><CheckCircle size={14} /> Settings saved!</>
+            : <><Save size={14} /> Save settings</>
+          }
         </button>
         {saved && (
-          <p className="text-sm" style={{ color: 'rgba(255,255,255,0.4)' }}>
+          <p style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
             Changes will apply on the next poll cycle.
           </p>
         )}

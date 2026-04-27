@@ -82,6 +82,14 @@ const migrations: Array<() => void> = [
   () => {
     db.exec(`ALTER TABLE trackers ADD COLUMN rewatch_since TEXT;`);
   },
+
+  // Migration 2 — show artwork URLs
+  () => {
+    db.exec(`
+      ALTER TABLE shows ADD COLUMN poster_url TEXT;
+      ALTER TABLE shows ADD COLUMN backdrop_url TEXT;
+    `);
+  },
 ];
 
 export function runMigrations(): void {

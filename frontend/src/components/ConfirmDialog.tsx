@@ -1,5 +1,3 @@
-import { AlertTriangle } from 'lucide-react';
-
 interface ConfirmDialogProps {
   title: string;
   message: string;
@@ -17,46 +15,46 @@ export function ConfirmDialog({
 }: ConfirmDialogProps) {
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
-      style={{ background: 'rgba(0,0,0,0.7)', backdropFilter: 'blur(4px)' }}
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.65)',
+        backdropFilter: 'blur(6px)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 100,
+      }}
       onClick={onCancel}
     >
       <div
-        className="w-full max-w-sm rounded-xl p-6 space-y-4 fade-up"
-        style={{
-          background: 'var(--bg-elevated)',
-          border: '1px solid rgba(255,255,255,0.1)',
-          boxShadow: '0 24px 64px rgba(0,0,0,0.6)',
-        }}
+        className="glass-panel"
+        style={{ width: 400, padding: '24px 28px' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex items-start gap-3">
-          <div className="p-2 rounded-lg" style={{ background: 'rgba(239,68,68,0.15)' }}>
-            <AlertTriangle size={18} style={{ color: 'var(--red)' }} />
-          </div>
-          <div>
-            <h3 className="font-bold text-white">{title}</h3>
-            <p className="text-sm mt-1" style={{ color: 'rgba(255,255,255,0.5)' }}>{message}</p>
-          </div>
-        </div>
-        <div className="flex gap-3 justify-end pt-2">
+        <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: 'var(--color-text-primary)', marginBottom: 8 }}>
+          {title}
+        </h3>
+        <p style={{ fontSize: '0.875rem', color: 'var(--color-text-secondary)', marginBottom: 24 }}>
+          {message}
+        </p>
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
           <button
             onClick={onCancel}
-            className="px-4 py-2 rounded-lg text-sm font-medium transition-colors"
             style={{
-              background: 'rgba(255,255,255,0.06)',
-              color: 'rgba(255,255,255,0.7)',
+              padding: '8px 16px', borderRadius: 'var(--radius-pill)',
+              border: '1px solid var(--color-glass-border)',
+              background: 'var(--color-glass-bg-light)',
+              color: 'var(--color-text-secondary)',
+              fontSize: '0.875rem', fontWeight: 600, cursor: 'pointer',
             }}
           >
             Cancel
           </button>
           <button
             onClick={onConfirm}
-            className="px-4 py-2 rounded-lg text-sm font-semibold transition-all"
             style={{
-              background: 'rgba(239,68,68,0.2)',
+              padding: '8px 16px', borderRadius: 'var(--radius-pill)',
               border: '1px solid rgba(239,68,68,0.4)',
+              background: 'rgba(239,68,68,0.15)',
               color: '#fca5a5',
+              fontSize: '0.875rem', fontWeight: 600, cursor: 'pointer',
             }}
           >
             {confirmLabel}

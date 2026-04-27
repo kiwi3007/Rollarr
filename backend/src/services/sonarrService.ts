@@ -103,12 +103,9 @@ export const sonarrService = {
 
   async getQueueForSeries(sonarrId: number): Promise<Array<{ id: number; seriesId?: number; episodeId?: number; title?: string }>> {
     const data = await sonarrFetch<{ records: Array<{ id: number; seriesId?: number; episodeId?: number; title?: string }> }>(
-      `/queue?pageSize=200&includeUnknownSeriesItems=false`
+      `/queue?seriesId=${sonarrId}&pageSize=50&includeUnknownSeriesItems=false`
     );
-    const all = data.records ?? [];
-    const filtered = all.filter((item) => item.seriesId === sonarrId);
-    logger.info(`Queue: ${all.length} total items, ${filtered.length} for seriesId=${sonarrId}`);
-    return filtered;
+    return data.records ?? [];
   },
 
   async removeFromQueue(queueId: number): Promise<void> {
