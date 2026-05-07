@@ -9,3 +9,4 @@ frontend/.env
 _legacy/
 .claude/
 .mcp.json.txt
+/rollarr

@@ -1,9 +1,11 @@
 services:
   rollarr:
-    build: .
+    image: gcr.io/distroless/static-debian12
+    entrypoint: ["/app/rollarr"]
     ports:
       - "3001:3001"
     volumes:
+      - ./rollarr:/app/rollarr:ro
       - ./data:/data
     environment:
       - DB_PATH=/data/rollarr.db
