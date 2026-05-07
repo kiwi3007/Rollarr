@@ -12,6 +12,7 @@ type migration func(tx *sql.Tx) error
 // To add a migration: append a new function to this slice.
 var migrations = []migration{
 	migration0,
+	migration1,
 }
 
 // migration0 creates the initial 4-table schema and seeds default settings.
@@ -79,6 +80,32 @@ func migration0(tx *sql.Tx) error {
 		}
 	}
 
+	return nil
+}
+
+// migration1 drops the FOREIGN KEY from user_requests.tvdb_id.
+// A request arrives before the show row exists (the request triggers the show
+// to be added via the Sonarr proxy), so the FK had the dependency backwards.
+// SQLite can't DROP CONSTRAINT, so we recreate the table preserving all data.
+func migration1(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS user_requests_new (
+			id                INTEGER PRIMARY KEY AUTOINCREMENT,
+			plex_user_id      TEXT NOT NULL,
+			tvdb_id           INTEGER NOT NULL,
+			request_timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			is_rewatching     INTEGER NOT NULL DEFAULT 0,
+			UNIQUE(plex_user_id, tvdb_id)
+		)`,
+		`INSERT INTO user_requests_new SELECT id, plex_user_id, tvdb_id, request_timestamp, is_rewatching FROM user_requests`,
+		`DROP TABLE user_requests`,
+		`ALTER TABLE user_requests_new RENAME TO user_requests`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration1: %w", err)
+		}
+	}
 	return nil
 }
 

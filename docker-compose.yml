@@ -6,7 +6,8 @@ services:
       - "3001:3001"
     volumes:
       - ./rollarr:/app/rollarr:ro
-      - ./data:/data
+      - /mnt/user/appdata/plex:/plex
+      - /mnt/user/appdata/rollarr/devdb/:/data
     environment:
       - DB_PATH=/data/rollarr.db
       - ROLLARR_API_TOKEN=${ROLLARR_API_TOKEN:-}
