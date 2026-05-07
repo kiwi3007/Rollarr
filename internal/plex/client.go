@@ -1,0 +1,321 @@
+package plex
+
+import (
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Client is a typed HTTP client for the Plex Media Server HTTP API.
+type Client struct {
+	BaseURL string
+	Token   string
+	http    *http.Client
+}
+
+// WatchHistoryEntry is a single entry from the Plex watch history.
+type WatchHistoryEntry struct {
+	AccountID  int
+	EpisodeKey string    // e.g. /library/metadata/12345
+	ViewedAt   time.Time
+	SeasonNum  int
+	EpisodeNum int
+}
+
+// PlexUser represents a Plex account (managed or home user).
+type PlexUser struct {
+	ID       int
+	Username string
+	Email    string
+}
+
+// NewClient constructs a Plex HTTP client with a 30-second timeout.
+func NewClient(baseURL, token string) *Client {
+	return &Client{
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		Token:   token,
+		http:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+// addToken appends the Plex authentication token as a query parameter.
+func (c *Client) addToken(rawURL string) string {
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	return rawURL + sep + "X-Plex-Token=" + url.QueryEscape(c.Token)
+}
+
+// getJSON performs a GET request and JSON-decodes the response body into out.
+func (c *Client) getJSON(path string, out interface{}) error {
+	start := time.Now()
+	log.Printf("[plex] GET %s (json)", path)
+
+	fullURL := c.BaseURL + path
+	req, err := http.NewRequest(http.MethodGet, c.addToken(fullURL), nil)
+	if err != nil {
+		return fmt.Errorf("plex GET %s: build request: %w", path, err)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		log.Printf("[plex] GET %s → error (%s): %v", path, time.Since(start), err)
+		return fmt.Errorf("plex GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	log.Printf("[plex] GET %s → %d (%s)", path, resp.StatusCode, time.Since(start))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("plex GET %s: status %d: %s", path, resp.StatusCode, body)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// getXML performs a GET request and XML-decodes the response body into out.
+func (c *Client) getXML(path string, out interface{}) error {
+	start := time.Now()
+	log.Printf("[plex] GET %s", path)
+
+	fullURL := c.BaseURL + path
+	req, err := http.NewRequest(http.MethodGet, c.addToken(fullURL), nil)
+	if err != nil {
+		return fmt.Errorf("plex GET %s: build request: %w", path, err)
+	}
+	req.Header.Set("Accept", "application/xml")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		log.Printf("[plex] GET %s → error (%s): %v", path, time.Since(start), err)
+		return fmt.Errorf("plex GET %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	log.Printf("[plex] GET %s → %d (%s)", path, resp.StatusCode, time.Since(start))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("plex GET %s: status %d: %s", path, resp.StatusCode, body)
+	}
+
+	if err := xml.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("plex GET %s: decode XML: %w", path, err)
+	}
+	return nil
+}
+
+// ---- XML response types ----------------------------------------------------
+
+type mediaContainer struct {
+	XMLName xml.Name `xml:"MediaContainer"`
+	Videos  []video  `xml:"Video"`
+}
+
+type video struct {
+	Key           string `xml:"key,attr"`
+	GrandparentKey string `xml:"grandparentKey,attr"`
+	ParentIndex   string `xml:"parentIndex,attr"`   // season number
+	Index         string `xml:"index,attr"`         // episode number
+	AccountID     string `xml:"accountID,attr"`
+	ViewedAt      string `xml:"viewedAt,attr"` // unix timestamp
+}
+
+// ---- Plex users XML types --------------------------------------------------
+
+type mediaContainerUsers struct {
+	XMLName xml.Name    `xml:"MediaContainer"`
+	Users   []plexUser  `xml:"User"`
+}
+
+type plexUser struct {
+	ID    string `xml:"id,attr"`
+	Name  string `xml:"name,attr"`  // Plex username (login name)
+	Title string `xml:"title,attr"` // display name
+	Email string `xml:"email,attr"`
+}
+
+// ---- Library search XML types ----------------------------------------------
+
+type mediaContainerDirectory struct {
+	XMLName     xml.Name    `xml:"MediaContainer"`
+	Directories []directory `xml:"Directory"`
+}
+
+type directory struct {
+	RatingKey string `xml:"ratingKey,attr"`
+	GUID      string `xml:"guid,attr"`
+	Title     string `xml:"title,attr"`
+}
+
+// GetShowHistory returns all watch history entries for the show identified by
+// the given Plex ratingKey (e.g. "12345").
+func (c *Client) GetShowHistory(showKey string) ([]WatchHistoryEntry, error) {
+	// Strip leading slash if present in the key.
+	key := strings.TrimPrefix(showKey, "/library/metadata/")
+	path := fmt.Sprintf("/status/sessions/history/all?type=4&metadataItemID=%s", url.QueryEscape(key))
+
+	var mc mediaContainer
+	if err := c.getXML(path, &mc); err != nil {
+		return nil, fmt.Errorf("plex.GetShowHistory(%s): %w", showKey, err)
+	}
+
+	return parseHistory(mc.Videos)
+}
+
+// GetAccountHistory returns watch history for a specific Plex account filtered
+// to the show identified by showKey.
+func (c *Client) GetAccountHistory(showKey string, accountId int) ([]WatchHistoryEntry, error) {
+	key := strings.TrimPrefix(showKey, "/library/metadata/")
+	path := fmt.Sprintf(
+		"/status/sessions/history/all?type=4&accountID=%d&metadataItemID=%s",
+		accountId, url.QueryEscape(key),
+	)
+
+	var mc mediaContainer
+	if err := c.getXML(path, &mc); err != nil {
+		return nil, fmt.Errorf("plex.GetAccountHistory(%s, %d): %w", showKey, accountId, err)
+	}
+
+	return parseHistory(mc.Videos)
+}
+
+func parseHistory(videos []video) ([]WatchHistoryEntry, error) {
+	entries := make([]WatchHistoryEntry, 0, len(videos))
+	for _, v := range videos {
+		accountID, _ := strconv.Atoi(v.AccountID)
+		season, _ := strconv.Atoi(v.ParentIndex)
+		episode, _ := strconv.Atoi(v.Index)
+		ts, _ := strconv.ParseInt(v.ViewedAt, 10, 64)
+		entries = append(entries, WatchHistoryEntry{
+			AccountID:  accountID,
+			EpisodeKey: v.Key,
+			ViewedAt:   time.Unix(ts, 0),
+			SeasonNum:  season,
+			EpisodeNum: episode,
+		})
+	}
+	return entries, nil
+}
+
+// FindShowByTVDB searches the Plex library for a show matching the given TVDB
+// ID and returns its ratingKey, or an error if not found.
+// Falls through to a full section scan that checks both legacy and modern GUIDs.
+func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
+	return c.findShowByTVDBFallback(tvdbId)
+}
+
+// findShowByTVDBFallback scans all TV library sections using the JSON API so
+// that both legacy (com.plexapp.agents.thetvdb) and modern (tvdb://) GUIDs
+// are checked. Modern Plex agents use plex://show/ as the primary guid and
+// store tvdb://XXXXX in the Guid array — only the JSON response includes that
+// array (XML only has the primary guid attribute).
+func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
+	// Use XML for sections list (known to work); JSON for individual section
+	// content so we get the Guid array needed to detect modern Plex agent shows.
+	var sections struct {
+		XMLName xml.Name `xml:"MediaContainer"`
+		Dirs    []struct {
+			Key  string `xml:"key,attr"`
+			Type string `xml:"type,attr"`
+		} `xml:"Directory"`
+	}
+	if err := c.getXML("/library/sections", &sections); err != nil {
+		return "", fmt.Errorf("plex.FindShowByTVDB: get sections: %w", err)
+	}
+
+	modernGUID := fmt.Sprintf("tvdb://%d", tvdbId)
+	legacyGUID := fmt.Sprintf("com.plexapp.agents.thetvdb://%d", tvdbId)
+
+	type jsonGuid struct {
+		ID string `json:"id"`
+	}
+	type jsonShow struct {
+		RatingKey string     `json:"ratingKey"`
+		Title     string     `json:"title"`
+		GUID      string     `json:"guid"`
+		Guid      []jsonGuid `json:"Guid"`
+	}
+	var showsResp struct {
+		MediaContainer struct {
+			Metadata []jsonShow `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+
+	for _, sec := range sections.Dirs {
+		if sec.Type != "show" {
+			continue
+		}
+		if err := c.getJSON("/library/sections/"+sec.Key+"/all?type=2&includeGuids=1", &showsResp); err != nil {
+			continue
+		}
+		for _, show := range showsResp.MediaContainer.Metadata {
+			if strings.Contains(show.GUID, legacyGUID) {
+				log.Printf("[plex] FindShowByTVDB tvdb=%d → %q (legacy GUID)", tvdbId, show.Title)
+				return show.RatingKey, nil
+			}
+			for _, g := range show.Guid {
+				if g.ID == modernGUID {
+					log.Printf("[plex] FindShowByTVDB tvdb=%d → %q (modern GUID)", tvdbId, show.Title)
+					return show.RatingKey, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
+}
+
+// GetUsers returns all Plex managed/home users visible to the server.
+func (c *Client) GetUsers() ([]PlexUser, error) {
+	var mc mediaContainerUsers
+	if err := c.getXML("/accounts", &mc); err != nil {
+		return nil, fmt.Errorf("plex.GetUsers: %w", err)
+	}
+
+	users := make([]PlexUser, 0, len(mc.Users))
+	for _, u := range mc.Users {
+		id, _ := strconv.Atoi(u.ID)
+		users = append(users, PlexUser{
+			ID:       id,
+			Username: u.Title,
+			Email:    u.Email,
+		})
+	}
+	return users, nil
+}
+
+// BuildUserMap returns a map of username → accountID for all Plex users.
+// Both the Plex display name (title) and login name (name) are indexed so
+// that either can resolve to the correct account ID. This is important for
+// the server owner/admin whose Seerr username may differ from their Plex
+// display name.
+func (c *Client) BuildUserMap() (map[string]int, error) {
+	var mc mediaContainerUsers
+	if err := c.getXML("/accounts", &mc); err != nil {
+		return nil, fmt.Errorf("plex.BuildUserMap: %w", err)
+	}
+
+	m := make(map[string]int, len(mc.Users)*2)
+	for _, u := range mc.Users {
+		id, _ := strconv.Atoi(u.ID)
+		if id == 0 {
+			continue
+		}
+		if u.Title != "" {
+			m[u.Title] = id
+		}
+		if u.Name != "" && u.Name != u.Title {
+			m[u.Name] = id
+		}
+	}
+	return m, nil
+}

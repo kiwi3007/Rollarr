@@ -1,13 +1,15 @@
 import { useState, useEffect } from 'react';
-import { Save, Loader2, CheckCircle, AlertCircle, Eye, EyeOff, ShieldAlert } from 'lucide-react';
+import { Save, Loader2, CheckCircle, AlertCircle, Eye, EyeOff } from 'lucide-react';
 import { api } from '../api/client';
 import type { SettingsMap } from '../api/client';
+
+const SECRET_SENTINEL = '***SET***';
 
 interface Field {
   key: string;
   label: string;
   placeholder?: string;
-  type?: 'text' | 'password' | 'number' | 'toggle';
+  type?: 'text' | 'password' | 'number';
   hint?: string;
 }
 
@@ -22,10 +24,10 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
   {
     title: 'Plex',
     fields: [
-      { key: 'plex_url',    label: 'Plex URL',            placeholder: 'http://plex:32400', type: 'text' },
-      { key: 'plex_token',  label: 'Plex Token',          type: 'password', hint: 'Admin token — covers all user types' },
-      { key: 'plex_db_path', label: 'Plex Database Path', placeholder: '/var/lib/plexmediaserver/…', type: 'text',
-        hint: 'Optional: path to Plex SQLite DB. Enables "Mark as Watched" tracking for all users including remote friends.' },
+      { key: 'plex_url',     label: 'Plex URL',            placeholder: 'http://plex:32400', type: 'text' },
+      { key: 'plex_token',   label: 'Plex Token',          type: 'password', hint: 'Admin token — covers all user types' },
+      { key: 'plex_db_path', label: 'Plex Database Path',  placeholder: '/var/lib/plexmediaserver/…', type: 'text',
+        hint: 'Optional: path to Plex SQLite DB. Enables "Mark as Watched" tracking.' },
     ],
   },
   {
@@ -38,20 +40,20 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
   {
     title: 'Behaviour',
     fields: [
-      { key: 'buffer_size',                  label: 'Buffer size (episodes)',          type: 'number', hint: 'Episodes kept on disk ahead of each active tracker' },
-      { key: 'starter_buffer_size',          label: 'Starter buffer (episodes)',       type: 'number', hint: 'Episodes always kept from the start of a show so new watchers can begin immediately' },
-      { key: 'inactivity_warn_days',         label: 'Inactivity warning (days)',       type: 'number' },
-      { key: 'inactivity_remove_days',       label: 'Inactivity removal (days)',       type: 'number', hint: 'Tracker removed and files deleted after this many inactive days' },
-      { key: 'poll_interval_minutes',        label: 'Poll interval (minutes)',         type: 'number', hint: 'Restart required to apply changes' },
-      { key: 'maintenance_interval_minutes', label: 'Maintenance interval (minutes)', type: 'number', hint: 'Restart required to apply changes' },
-      { key: 'cancel_queued_downloads', label: 'Cancel queued downloads', type: 'toggle', hint: 'Remove episodes outside the buffer from the download queue when a show is bootstrapped.' },
-      { key: 'dry_mode', label: 'Dry mode', type: 'toggle', hint: 'Log deletions without executing them. Files are never removed while this is on.' },
+      { key: 'global_buffer_size',           label: 'Buffer size (episodes)',          type: 'number', hint: 'Episodes kept on disk ahead of each active request' },
+      { key: 'global_inactivity_days',        label: 'Inactivity threshold (days)',     type: 'number', hint: 'Show marked inactive after this many days without activity' },
+      { key: 'reconcile_interval_minutes',   label: 'Reconcile interval (minutes)',    type: 'number', hint: 'Requires restart to apply changes' },
+      { key: 'inactivity_interval_minutes',  label: 'Inactivity check interval (minutes)', type: 'number', hint: 'Requires restart to apply changes' },
     ],
   },
 ];
 
+const SECRET_KEYS = new Set(['sonarr_api_key', 'plex_token', 'seerr_webhook_secret']);
+
 export function Settings() {
   const [values, setValues] = useState<SettingsMap>({});
+  // Track which secret fields the user has typed a new value into
+  const [secretEdits, setSecretEdits] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -59,9 +61,11 @@ export function Settings() {
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    api.getSettings().then((result) => {
-      if ('data' in result) setValues(result.data);
-      else setError(result.error);
+    api.getSettings().then((data) => {
+      setValues(data);
+      setLoading(false);
+    }).catch((err) => {
+      setError(err instanceof Error ? err.message : 'Failed to load settings');
       setLoading(false);
     });
   }, []);
@@ -70,12 +74,25 @@ export function Settings() {
     e.preventDefault();
     setSaving(true);
     setError(null);
-    const result = await api.saveSettings(values);
-    if ('error' in result) {
-      setError(result.error);
-    } else {
+
+    // Build payload: for secrets, only send new value if user typed something; otherwise send sentinel
+    const payload: SettingsMap = { ...values };
+    for (const key of SECRET_KEYS) {
+      if (secretEdits[key] !== undefined && secretEdits[key] !== '') {
+        payload[key] = secretEdits[key];
+      } else if (values[key] === SECRET_SENTINEL) {
+        payload[key] = SECRET_SENTINEL; // preserve existing secret
+      }
+    }
+
+    try {
+      const updated = await api.saveSettings(payload);
+      setValues(updated);
+      setSecretEdits({});
       setSaved(true);
       setTimeout(() => setSaved(false), 3000);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to save settings');
     }
     setSaving(false);
   }
@@ -89,7 +106,11 @@ export function Settings() {
   }
 
   function set(key: string, val: string) {
-    setValues((v) => ({ ...v, [key]: val }));
+    if (SECRET_KEYS.has(key)) {
+      setSecretEdits((prev) => ({ ...prev, [key]: val }));
+    } else {
+      setValues((v) => ({ ...v, [key]: val }));
+    }
   }
 
   if (loading) {
@@ -100,8 +121,6 @@ export function Settings() {
     );
   }
 
-  const dryModeActive = values['dry_mode'] === 'true';
-
   return (
     <form
       onSubmit={handleSave}
@@ -111,22 +130,9 @@ export function Settings() {
       <div>
         <h1 style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--color-text-primary)' }}>Settings</h1>
         <p style={{ marginTop: 6, fontSize: '0.875rem', color: 'var(--color-text-muted)' }}>
-          Configuration is stored in the database — changes take effect on the next poll.
+          Configuration is stored in the database — changes take effect on the next reconcile cycle.
         </p>
       </div>
-
-      {dryModeActive && (
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px',
-          borderRadius: 'var(--radius-card)',
-          background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.3)',
-        }}>
-          <ShieldAlert size={16} style={{ color: 'var(--color-accent-amber)', flexShrink: 0 }} />
-          <p style={{ color: '#fcd34d', fontWeight: 600, fontSize: '0.85rem' }}>
-            Dry mode is active — no files will be deleted.
-          </p>
-        </div>
-      )}
 
       {FIELD_GROUPS.map((group) => (
         <div key={group.title} className="settings-group">
@@ -135,31 +141,18 @@ export function Settings() {
           </div>
           <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
             {group.fields.map((field) => {
-              if (field.type === 'toggle') {
-                const isOn = values[field.key] === 'true';
-                return (
-                  <div key={field.key} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 16 }}>
-                    <div>
-                      <div style={{ fontWeight: 600, fontSize: '0.85rem', color: 'var(--color-text-secondary)' }}>{field.label}</div>
-                      {field.hint && <div style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)', marginTop: 2 }}>{field.hint}</div>}
-                    </div>
-                    <button
-                      type="button"
-                      className="toggle-track"
-                      onClick={() => set(field.key, isOn ? 'false' : 'true')}
-                      style={{
-                        background: isOn ? 'var(--color-accent-orange)' : 'rgba(255,255,255,0.1)',
-                        boxShadow: isOn ? '0 0 12px rgba(249,115,22,0.3)' : 'none',
-                      }}
-                    >
-                      <span className="toggle-thumb" style={{ left: isOn ? 24 : 4 }} />
-                    </button>
-                  </div>
-                );
-              }
-
+              const isSecret = SECRET_KEYS.has(field.key);
               const isPassword = field.type === 'password';
               const show = revealed.has(field.key);
+
+              // For secrets: show the edit value if user typed something, else show empty
+              // (placeholder explains the sentinel)
+              const inputValue = isSecret
+                ? (secretEdits[field.key] ?? '')
+                : (values[field.key] ?? '');
+
+              const isAlreadySet = isSecret && values[field.key] === SECRET_SENTINEL;
+
               return (
                 <div key={field.key}>
                   <label style={{ display: 'block', fontSize: '0.82rem', fontWeight: 600, marginBottom: 6, color: 'var(--color-text-secondary)' }}>
@@ -168,9 +161,9 @@ export function Settings() {
                   <div style={{ position: 'relative' }}>
                     <input
                       type={isPassword ? (show ? 'text' : 'password') : (field.type ?? 'text')}
-                      value={values[field.key] ?? ''}
+                      value={inputValue}
                       onChange={(e) => set(field.key, e.target.value)}
-                      placeholder={field.placeholder}
+                      placeholder={isAlreadySet ? 'already set — enter new value to change' : field.placeholder}
                       className="glass-input"
                       style={{ paddingRight: isPassword ? 40 : 14 }}
                     />
@@ -232,7 +225,7 @@ export function Settings() {
         </button>
         {saved && (
           <p style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
-            Changes will apply on the next poll cycle.
+            Changes will apply on the next reconcile cycle.
           </p>
         )}
       </div>

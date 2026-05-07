@@ -1,25 +1,17 @@
 services:
   rollarr:
-    image: ghcr.io/kiwi3007/rollarr:latest
-    # Uncomment to build locally instead:
-    # build: .
-    container_name: rollarr
+    build: .
     ports:
       - "3001:3001"
     volumes:
-      - rollarr_data:/data
-      # Optional: mount Plex SQLite DB for "Mark as Watched" support
-      # - /path/to/plex/Library/Application Support/Plex Media Server/Plug-in Support/Databases:/plex-db:ro
+      - ./data:/data
     environment:
-      - NODE_ENV=production
-      - SONARR_URL=${SONARR_URL}
-      - SONARR_API_KEY=${SONARR_API_KEY}
-      - PLEX_URL=${PLEX_URL}
-      - PLEX_TOKEN=${PLEX_TOKEN}
-      - SEERR_WEBHOOK_SECRET=${SEERR_WEBHOOK_SECRET}
-      # If using Plex DB mount above, set this to the path inside the container:
-      # - PLEX_DB_PATH=/plex-db/com.plexapp.plugins.library.db
+      - DB_PATH=/data/rollarr.db
+      - ROLLARR_API_TOKEN=${ROLLARR_API_TOKEN:-}
+      - SONARR_URL=${SONARR_URL:-}
+      - SONARR_API_KEY=${SONARR_API_KEY:-}
+      - PLEX_URL=${PLEX_URL:-}
+      - PLEX_TOKEN=${PLEX_TOKEN:-}
+      - PLEX_DB_PATH=${PLEX_DB_PATH:-}
+      - SEERR_WEBHOOK_SECRET=${SEERR_WEBHOOK_SECRET:-}
     restart: unless-stopped
-
-volumes:
-  rollarr_data:

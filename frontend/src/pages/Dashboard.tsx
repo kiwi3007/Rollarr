@@ -1,51 +1,30 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
-import { Loader2, Radio, Tv } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Loader2, Tv } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowSummary } from '../api/client';
 import { ShowCard } from '../components/ShowCard';
-import { usePolling } from '../hooks/usePolling';
-import { useBackdrop } from '../context/BackdropContext';
 
 export function Dashboard() {
   const [shows, setShows] = useState<ShowSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const dashRef = useRef<HTMLDivElement>(null);
-  const { setBackdrop } = useBackdrop();
 
   const load = useCallback(async () => {
-    const result = await api.getShows();
-    if ('error' in result) {
-      setError(result.error);
-    } else {
-      setShows(result.data);
+    try {
+      const data = await api.getShows();
+      setShows(data);
       setError(null);
-      // Pick a random backdrop from active shows
-      const withBackdrop = result.data.filter((s) => s.backdrop_url && s.status === 'Active');
-      if (withBackdrop.length > 0) {
-        const pick = withBackdrop[Math.floor(Math.random() * withBackdrop.length)];
-        setBackdrop(pick.backdrop_url);
-      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to load shows');
     }
     setLoading(false);
-  }, [setBackdrop]);
+  }, []);
 
-  useEffect(() => { load(); }, [load]);
-  usePolling(load, 60_000);
-
-  // Equalise card heights across the entire grid
   useEffect(() => {
-    function equalise() {
-      if (!dashRef.current) return;
-      const cards = [...dashRef.current.querySelectorAll<HTMLElement>('.show-card')];
-      cards.forEach((c) => { c.style.minHeight = ''; });
-      const max = cards.reduce((m, c) => Math.max(m, c.offsetHeight), 0);
-      if (max > 0) cards.forEach((c) => { c.style.minHeight = `${max}px`; });
-    }
-    const t = setTimeout(equalise, 500);
-    window.addEventListener('resize', equalise);
-    return () => { clearTimeout(t); window.removeEventListener('resize', equalise); };
-  }, [shows]);
+    load();
+    const interval = setInterval(load, 30_000);
+    return () => clearInterval(interval);
+  }, [load]);
 
   if (loading) {
     return (
@@ -70,9 +49,9 @@ export function Dashboard() {
     );
   }
 
-  const active    = shows.filter((s) => s.status === 'Active');
-  const stale     = shows.filter((s) => s.status === 'Stale');
-  const completed = shows.filter((s) => s.status === 'Completed');
+  const active   = shows.filter((s) => s.status === 'active');
+  const inactive = shows.filter((s) => s.status === 'inactive');
+  const removed  = shows.filter((s) => s.status === 'removed');
 
   if (shows.length === 0) {
     return (
@@ -99,7 +78,10 @@ export function Dashboard() {
     return (
       <section>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-          <Radio size={13} style={{ color }} />
+          <span style={{
+            display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
+            background: color, boxShadow: `0 0 6px ${color}`,
+          }} />
           <span className="overline" style={{ color, letterSpacing: '0.1em' }}>{label}</span>
         </div>
         <div style={{
@@ -109,7 +91,7 @@ export function Dashboard() {
           alignItems: 'stretch',
         }}>
           {items.map((show, i) => (
-            <ShowCard key={show.id} show={show} delay={i * 60} />
+            <ShowCard key={show.tvdb_id} show={show} delay={i * 60} onReconcile={load} />
           ))}
         </div>
       </section>
@@ -117,13 +99,13 @@ export function Dashboard() {
   }
 
   return (
-    <div ref={dashRef} className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
+    <div className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
         {[
-          { label: 'Active',    count: active.length,    color: 'var(--color-accent-green)' },
-          { label: 'Stale',     count: stale.length,     color: 'var(--color-accent-amber)' },
-          { label: 'Completed', count: completed.length,  color: 'var(--color-accent-blue)'  },
+          { label: 'Active',   count: active.length,   color: 'var(--color-accent-green)' },
+          { label: 'Inactive', count: inactive.length,  color: 'var(--color-accent-amber)' },
+          { label: 'Removed',  count: removed.length,   color: 'var(--color-accent-danger, #ef4444)' },
         ].map((stat) => (
           <div key={stat.label} className="stat-card">
             <div className="mono" style={{ fontSize: '2rem', fontWeight: 800, lineHeight: 1, color: stat.color }}>
@@ -139,9 +121,9 @@ export function Dashboard() {
         ))}
       </div>
 
-      <Section label="Active"    color="var(--color-accent-green)"  items={active} />
-      <Section label="Stale"     color="var(--color-accent-amber)"  items={stale}  opacity={0.75} />
-      <Section label="Completed" color="var(--color-accent-blue)"   items={completed} opacity={0.6} />
+      <Section label="Active"   color="var(--color-accent-green)"  items={active} />
+      <Section label="Inactive" color="var(--color-accent-amber)"  items={inactive} opacity={0.75} />
+      <Section label="Removed"  color="#ef4444"                     items={removed}  opacity={0.6} />
     </div>
   );
 }

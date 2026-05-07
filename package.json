@@ -1,11 +1,10 @@
 {
   "name": "rollarr",
   "private": true,
-  "workspaces": ["shared", "backend", "frontend"],
+  "workspaces": ["shared", "frontend"],
   "scripts": {
-    "dev": "concurrently \"npm run dev -w backend\" \"npm run dev -w frontend\"",
-    "build": "npm run build -w shared && npm run build -w backend && npm run build -w frontend",
-    "start": "npm run start -w backend"
+    "dev": "vite --config frontend/vite.config.ts",
+    "build": "npm run build -w shared && npm run build -w frontend"
   },
   "devDependencies": {
     "concurrently": "^9.0.0"

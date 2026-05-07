@@ -1,8 +1,9 @@
 import { useState, useEffect } from 'react';
 import { Routes, Route, NavLink } from 'react-router-dom';
-import { LayoutGrid, Settings as SettingsIcon, Film, Sun, Moon } from 'lucide-react';
+import { LayoutGrid, Settings as SettingsIcon, Film, Sun, Moon, Flag } from 'lucide-react';
 import { Dashboard } from './pages/Dashboard';
 import { ShowDetail } from './pages/ShowDetail';
+import { FlagsPage } from './pages/FlagsPage';
 import { Settings } from './pages/Settings';
 import { BackdropContext } from './context/BackdropContext';
 
@@ -37,6 +38,7 @@ export default function App() {
 
   const navItems = [
     { to: '/',         icon: <LayoutGrid size={18} />,   label: 'Dashboard' },
+    { to: '/flags',    icon: <Flag size={18} />,         label: 'Flags'     },
     { to: '/settings', icon: <SettingsIcon size={18} />, label: 'Settings'  },
   ];
 
@@ -79,9 +81,10 @@ export default function App() {
 
       <main className="main-content">
         <Routes>
-          <Route path="/"          element={<Dashboard />} />
-          <Route path="/shows/:id" element={<ShowDetail />} />
-          <Route path="/settings"  element={<Settings />} />
+          <Route path="/"                  element={<Dashboard />} />
+          <Route path="/shows/:tvdbId"     element={<ShowDetail />} />
+          <Route path="/flags"             element={<FlagsPage />} />
+          <Route path="/settings"          element={<Settings />} />
         </Routes>
       </main>
     </BackdropContext.Provider>

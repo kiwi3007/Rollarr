@@ -1,76 +1,64 @@
-// ── Inline types ────────────────────────────────────────────────────────────
-
-export interface ShowRow {
-  id: number; sonarr_id: number; title: string; tvdb_id: number;
-  status: 'Active' | 'Stale' | 'Completed';
-  buffer_size: number; current_window_start: number; current_season: number;
-  poster_url: string | null; backdrop_url: string | null;
-  created_at: string; updated_at: string;
+// Types
+export interface ShowSummary {
+  tvdb_id: number;
+  sonarr_id: number;
+  title: string;
+  status: 'active' | 'inactive' | 'removed';
+  effective_buffer_size: number;
+  active_request_count: number;
+  last_activity_at: string | null;
 }
 
-export interface SeasonData { season: number; total_episodes: number; }
-
-export interface ShowSummary extends ShowRow {
-  trackerCount: number;
-  trackers: TrackerWithUser[];
-  season_data: SeasonData[];
+export interface UserRequest {
+  plex_user_id: string;
+  tvdb_id: number;
+  request_timestamp: string;
+  is_rewatching: boolean;
 }
 
-export interface TrackerRow {
-  id: number; show_id: number; user_id: number;
-  last_watched_episode: number; last_watched_season: number;
-  is_active: 1 | 0; watchlist_active: 1 | 0; created_at: string;
-}
-export type TrackerWithUser = TrackerRow & { plex_username: string; last_activity: string; };
-
-export interface EpisodeRow {
-  id: number; show_id: number; sonarr_episode_id: number;
-  sonarr_file_id: number | null; season: number; episode_number: number;
-  status: 'Monitored' | 'Unmonitored' | 'Watched' | 'Deleted';
+export interface Flag {
+  id: number;
+  tvdb_id: number;
+  sonarr_episode_id: number | null;
+  issue_description: string;
+  status: 'open' | 'resolved' | 'ignored';
+  created_at: string;
+  updated_at: string;
 }
 
-export interface ShowWithTrackers extends ShowRow {
-  trackers: TrackerWithUser[];
-  episodes: EpisodeRow[];
-  season_data: SeasonData[];
-}
-
-export interface UserRow {
-  id: number; plex_account_id: string; plex_username: string; last_active_at: string;
+export interface ShowDetail extends ShowSummary {
+  requests: UserRequest[];
+  expected_state: Record<number, number[]>;
+  open_flags: Flag[];
 }
 
 export type SettingsMap = Record<string, string>;
 
-// ── Fetch helper ────────────────────────────────────────────────────────────
+// API client
+const TOKEN = (window as any).__ROLLARR_TOKEN__ ?? '';
 
-async function apiFetch<T>(
-  path: string,
-  init?: RequestInit
-): Promise<{ data: T } | { error: string }> {
-  try {
-    const res = await fetch(`/api${path}`, {
-      headers: { 'Content-Type': 'application/json' },
-      ...init,
-    });
-    const json = await res.json();
-    if (!res.ok) return { error: json.error ?? `HTTP ${res.status}` };
-    return json as { data: T };
-  } catch (err) {
-    return { error: err instanceof Error ? err.message : 'Network error' };
-  }
+async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    ...opts,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+      ...opts?.headers,
+    },
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
 }
 
-// ── API client ──────────────────────────────────────────────────────────────
-
 export const api = {
-  getShows:         () => apiFetch<ShowSummary[]>('/shows'),
-  getShow:          (id: number) => apiFetch<ShowWithTrackers>(`/shows/${id}`),
-  refreshShow:      (id: number) => apiFetch<{ queued: boolean }>(`/shows/${id}/refresh`, { method: 'POST' }),
-  getUsers:         () => apiFetch<UserRow[]>('/users'),
-  getTrackers:      () => apiFetch<(TrackerWithUser & { show_title: string })[]>('/trackers'),
-  dropTracker:      (showId: number, userId: number) =>
-    apiFetch<{ ok: boolean }>(`/shows/${showId}/trackers/${userId}`, { method: 'DELETE' }),
-  getSettings:      () => apiFetch<SettingsMap>('/settings'),
-  saveSettings:     (settings: SettingsMap) =>
-    apiFetch<SettingsMap>('/settings', { method: 'PUT', body: JSON.stringify(settings) }),
+  getShows: () => apiFetch<ShowSummary[]>('/api/shows'),
+  getShow: (tvdbId: number) => apiFetch<ShowDetail>(`/api/shows/${tvdbId}`),
+  reconcileShow: (tvdbId: number) => apiFetch<{queued: boolean}>(`/api/shows/${tvdbId}/reconcile`, { method: 'POST' }),
+  deleteRequest: (tvdbId: number, plexUserId: string) =>
+    apiFetch<{ok: boolean}>(`/api/shows/${tvdbId}/requests/${encodeURIComponent(plexUserId)}`, { method: 'DELETE' }),
+  getFlags: () => apiFetch<Flag[]>('/api/flags'),
+  updateFlag: (id: number, status: 'resolved' | 'ignored') =>
+    apiFetch<Flag>(`/api/flags/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),
+  getSettings: () => apiFetch<SettingsMap>('/api/settings'),
+  saveSettings: (s: SettingsMap) => apiFetch<SettingsMap>('/api/settings', { method: 'PUT', body: JSON.stringify(s) }),
 };

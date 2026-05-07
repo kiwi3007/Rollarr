@@ -44,6 +44,7 @@ export interface TrackerRow {
   user_id:              number;
   last_watched_episode: number;
   last_watched_season:  number;
+  current_season:       number;
   is_active:            1 | 0;
   watchlist_active:     1 | 0;
   rewatch_since:        string | null;
@@ -89,7 +90,7 @@ export interface SonarrEpisode {
   episodeNumber: number;
   monitored:     boolean;
   hasFile:       boolean;
-  episodeFileId: number;
+  episodeFileId: number | null;
 }
 
 export interface SonarrEpisodeFile {
@@ -141,6 +142,7 @@ export interface SeerrWebhookPayload {
     requestedBy: {
       plexUsername: string;
     };
+    seasons?: Array<{ seasonNumber: number }>;
   };
   subject: string;
 }

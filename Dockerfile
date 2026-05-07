@@ -1,52 +1,21 @@
-# ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
-
-# better-sqlite3 requires native compilation
-RUN apk add --no-cache python3 make g++
-
-WORKDIR /app
-
-# Install deps first for layer caching
-COPY package*.json ./
-COPY shared/package.json ./shared/
-COPY backend/package.json ./backend/
-COPY frontend/package.json ./frontend/
+# Stage 1: Build frontend
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
 RUN npm ci
-
-# Build all workspaces
-COPY shared/ ./shared/
-COPY backend/ ./backend/
-COPY frontend/ ./frontend/
+COPY frontend/ .
 RUN npm run build
 
-# ── Stage 2: production ────────────────────────────────────────────────────────
-FROM node:20-alpine
-
+# Stage 2: Build Go binary
+FROM golang:1.23-alpine AS go-builder
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
+RUN go build -o /rollarr ./cmd/rollarr/
 
-# Install prod deps (includes native rebuild for better-sqlite3), then drop build tools
-COPY package*.json ./
-COPY shared/package.json ./shared/
-COPY backend/package.json ./backend/
-COPY frontend/package.json ./frontend/
-RUN apk add --no-cache --virtual .build-deps python3 make g++ && \
-    npm ci --omit=dev && \
-    apk del .build-deps
-
-# Copy compiled artifacts from builder
-COPY --from=builder /app/shared/dist ./shared/dist
-COPY --from=builder /app/backend/dist ./backend/dist
-COPY --from=builder /app/frontend/dist ./frontend/dist
-
-ENV NODE_ENV=production
-ENV DB_PATH=/data/rollarr.db
-
-RUN mkdir /data && chown node:node /data
-
-EXPOSE 3001
-
-VOLUME ["/data"]
-
-USER node
-
-CMD ["node", "backend/dist/index.js"]
+# Stage 3: Runtime
+FROM gcr.io/distroless/static-debian12
+COPY --from=go-builder /rollarr /rollarr
+ENTRYPOINT ["/rollarr"]

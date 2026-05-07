@@ -6,3 +6,6 @@ dist/
 backend/.env
 frontend/.env
 .env
+_legacy/
+.claude/
+.mcp.json.txt
