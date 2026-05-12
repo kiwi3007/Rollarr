@@ -10,6 +10,7 @@ import (
 	rollarr "github.com/kiwi3007/rollarr"
 	"github.com/kiwi3007/rollarr/internal/api"
 	"github.com/kiwi3007/rollarr/internal/config"
+	"github.com/kiwi3007/rollarr/internal/logbuf"
 	"github.com/kiwi3007/rollarr/internal/db"
 	"github.com/kiwi3007/rollarr/internal/db/repository"
 	"github.com/kiwi3007/rollarr/internal/plex"
@@ -22,6 +23,7 @@ import (
 )
 
 func main() {
+	logbuf.Install(nil) // capture log output into ring buffer; nil = also write to stderr
 	cfg := config.Load()
 
 	// ── Database ─────────────────────────────────────────────────────────────
@@ -80,7 +82,7 @@ func main() {
 	queue.Start()
 
 	// ── Reconciler ───────────────────────────────────────────────────────────
-	reconciler := reconcile.NewReconciler(shows, requests, flags, sonarrClient, plexClient, engine)
+	reconciler := reconcile.NewReconciler(shows, requests, flags, sonarrClient, plexClient, plexDB, engine)
 
 	// ── Scheduler ────────────────────────────────────────────────────────────
 	sched := scheduler.NewScheduler(reconciler, settings, queue)
@@ -98,9 +100,9 @@ func main() {
 
 	// ── Proxy ────────────────────────────────────────────────────────────────
 	interceptor := proxy.NewInterceptor(sonarrClient, shows, engine)
-	interceptor.OnSeriesAdd = func(tvdbId int) {
+	interceptor.OnSeriesAdd = func(tvdbId int, requestedSeasons []int) {
 		queue.Enqueue(func() {
-			log.Printf("[proxy] onboard tvdb=%d: waiting for Sonarr to index series", tvdbId)
+			log.Printf("[proxy] onboard tvdb=%d: waiting for Sonarr to index series, requestedSeasons=%v", tvdbId, requestedSeasons)
 
 			// Retry fetching from Sonarr — the series add is confirmed (2xx) but
 			// Sonarr's internal indexing may not be complete immediately.
@@ -120,14 +122,33 @@ func main() {
 			}
 
 			if err := shows.Upsert(repository.Show{
-				TVDBId:   tvdbId,
-				SonarrId: series.ID,
-				Title:    series.Title,
-				Status:   "active",
+				TVDBId:    tvdbId,
+				SonarrId:  series.ID,
+				Title:     series.Title,
+				PosterURL: series.PosterURL(),
+				FanartURL: series.FanartURL(),
+				Status:    "active",
 			}); err != nil {
 				log.Printf("[proxy] onboard tvdb=%d: upsert show: %v", tvdbId, err)
 				return
 			}
+
+			// Persist the requested season on the most-recent user_request.
+			// Pick the lowest monitored season = where they want to start.
+			if len(requestedSeasons) > 0 {
+				minSeason := requestedSeasons[0]
+				for _, s := range requestedSeasons[1:] {
+					if s < minSeason {
+						minSeason = s
+					}
+				}
+				if err := requests.SetRequestedSeason(tvdbId, minSeason); err != nil {
+					log.Printf("[proxy] onboard tvdb=%d: set requested season: %v", tvdbId, err)
+				} else {
+					log.Printf("[proxy] onboard tvdb=%d: requested season set to %d", tvdbId, minSeason)
+				}
+			}
+
 			log.Printf("[proxy] onboard tvdb=%d (%s) upserted, reconciling", tvdbId, series.Title)
 
 			if err := reconciler.ReconcileShow(tvdbId); err != nil {
@@ -152,7 +173,7 @@ func main() {
 	)
 
 	// ── API router ───────────────────────────────────────────────────────────
-	apiRouter := api.NewRouter(shows, requests, flags, settings, reconciler, queue, apiToken, rollarr.FrontendFS)
+	apiRouter := api.NewRouter(shows, requests, flags, settings, reconciler, queue, apiToken, rollarr.FrontendFS, engine, sonarrClient, plexClient)
 
 	// ── Root router ──────────────────────────────────────────────────────────
 	r := chi.NewRouter()

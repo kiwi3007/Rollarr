@@ -13,6 +13,9 @@ type migration func(tx *sql.Tx) error
 var migrations = []migration{
 	migration0,
 	migration1,
+	migration2,
+	migration3,
+	migration4,
 }
 
 // migration0 creates the initial 4-table schema and seeds default settings.
@@ -104,6 +107,47 @@ func migration1(tx *sql.Tx) error {
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("migration1: %w", err)
+		}
+	}
+	return nil
+}
+
+// migration2 adds last_watched_season and last_watched_episode to user_requests
+// so the UI can display per-user progress without a live Plex call.
+func migration2(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE user_requests ADD COLUMN last_watched_season  INTEGER`,
+		`ALTER TABLE user_requests ADD COLUMN last_watched_episode INTEGER`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration2: %w", err)
+		}
+	}
+	return nil
+}
+
+// migration3 adds requested_season to user_requests so the state engine can
+// seed the buffer window from the correct season instead of always defaulting
+// to S01. Season is populated via the Sonarr proxy when a series is added.
+func migration3(tx *sql.Tx) error {
+	_, err := tx.Exec(`ALTER TABLE user_requests ADD COLUMN requested_season INTEGER NOT NULL DEFAULT 1`)
+	if err != nil {
+		return fmt.Errorf("migration3: %w", err)
+	}
+	return nil
+}
+
+// migration4 adds display_name to user_requests (stores Seerr display name)
+// and fanart_url to shows (stores Sonarr fanart image URL).
+func migration4(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE user_requests ADD COLUMN display_name TEXT`,
+		`ALTER TABLE shows ADD COLUMN fanart_url TEXT`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration4: %w", err)
 		}
 	}
 	return nil

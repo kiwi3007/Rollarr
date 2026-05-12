@@ -82,7 +82,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		rp.ServeHTTP(result, result.Request)
 		if result.succeeded() && result.TvdbId != 0 && p.intercept.OnSeriesAdd != nil {
 			tvdbId := result.TvdbId
-			go p.intercept.OnSeriesAdd(tvdbId)
+			seasons := result.RequestedSeasons
+			go p.intercept.OnSeriesAdd(tvdbId, seasons)
 		}
 
 	case r.Method == http.MethodPut && isPath(r.URL.Path, "/api/v3/episode/monitor"):

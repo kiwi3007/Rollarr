@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
@@ -62,10 +63,14 @@ type SeerrPayload struct {
 	// Overseerr flat structure.
 	Request struct {
 		RequestedByUsername string `json:"requestedBy_username"`
+		RequestedByEmail    string `json:"requestedBy_email"`
+		Season              int    `json:"season"` // 0 when absent (whole-show request)
 	} `json:"request"`
 	// Jellyseerr nested structure.
 	RequestedBy struct {
 		PlexUsername string `json:"plexUsername"`
+		DisplayName  string `json:"displayName"`
+		Email        string `json:"email"`
 	} `json:"requestedBy"`
 }
 
@@ -138,10 +143,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract plex username: try Overseerr flat, then Jellyseerr nested.
+	// Extract plex username + email + display name: try Overseerr flat, then Jellyseerr nested.
 	plexUsername := payload.Request.RequestedByUsername
+	email := payload.Request.RequestedByEmail
+	displayName := payload.Request.RequestedByUsername // Overseerr: username IS the display name
 	if plexUsername == "" {
 		plexUsername = payload.RequestedBy.PlexUsername
+	}
+	if email == "" {
+		email = payload.RequestedBy.Email
+	}
+	if payload.RequestedBy.DisplayName != "" {
+		displayName = payload.RequestedBy.DisplayName // Jellyseerr has explicit displayName
 	}
 	if plexUsername == "" {
 		log.Printf("[webhook] rejected tvdb=%d: no requestedBy username in payload (request=%+v requestedBy=%+v)",
@@ -149,10 +162,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing requestedBy username", http.StatusBadRequest)
 		return
 	}
-	log.Printf("[webhook] processing tvdb=%d requestedBy=%q", payload.Media.TvdbId, plexUsername)
+	log.Printf("[webhook] processing tvdb=%d requestedBy=%q displayName=%q email=%q", payload.Media.TvdbId, plexUsername, displayName, email)
 
-	// Resolve plexUsername → plexUserId via Plex account list.
-	plexUserId := h.resolvePlexUser(plexUsername)
+	// Resolve plexUsername → plexUserId via Plex account list, falling back to email.
+	plexUserId := h.resolvePlexUser(plexUsername, email)
 
 	// Upsert show row from Sonarr. Seerr fires the webhook before sending
 	// POST /api/v3/series to Sonarr, so the series may not exist yet — log and
@@ -161,12 +174,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[webhook] upsert show %d: %v (will retry via proxy onboard)", tvdbId, err)
 	}
 
+	// Treat missing season as 1 (whole-show request implies starting from S01).
+	requestedSeason := payload.Request.Season
+	if requestedSeason <= 0 {
+		requestedSeason = 1
+	}
+
 	// Check if user is rewatching.
-	isRewatching := h.isRewatching(tvdbId, plexUserId)
+	isRewatching := h.isRewatching(tvdbId, plexUserId, requestedSeason)
 
 	// Upsert user request.
 	req := repository.UserRequest{
 		PlexUserID:       plexUserId,
+		DisplayName:      displayName,
 		TVDBId:           tvdbId,
 		RequestTimestamp: time.Now(),
 		IsRewatching:     isRewatching,
@@ -189,20 +209,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"queued": true}) //nolint:errcheck
 }
 
-// resolvePlexUser attempts to map a username to a Plex account ID string.
-// If the Plex user map cannot be built or the user is not found, the username
-// is returned as-is (prefixed with "seerr:").
-func (h *Handler) resolvePlexUser(username string) string {
+// resolvePlexUser attempts to map a username (or email) to a Plex account ID.
+// Tries username first, then email if provided. Falls back to "seerr:<username>"
+// when neither matches, deferring resolution to discoverNewWatchers.
+func (h *Handler) resolvePlexUser(username, email string) string {
 	userMap, err := h.plex.BuildUserMap()
 	if err != nil {
 		log.Printf("[webhook] build plex user map: %v", err)
 		return "seerr:" + username
 	}
-	id, ok := userMap[username]
-	if !ok {
-		return "seerr:" + username
+	if id, ok := userMap[username]; ok {
+		log.Printf("[webhook] resolved %q → accountId=%d (username match)", username, id)
+		return fmt.Sprintf("%d", id)
 	}
-	return fmt.Sprintf("%d", id)
+	if email != "" {
+		if id, ok := userMap[email]; ok {
+			log.Printf("[webhook] resolved %q → accountId=%d (email match)", username, id)
+			return fmt.Sprintf("%d", id)
+		}
+	}
+	log.Printf("[webhook] could not resolve %q (email=%q) — deferring to seerr:", username, email)
+	return "seerr:" + username
 }
 
 // upsertShow fetches the show from Sonarr and upserts it into the DB.
@@ -213,70 +240,42 @@ func (h *Handler) upsertShow(tvdbId int) error {
 	}
 
 	show := repository.Show{
-		TVDBId:   tvdbId,
-		SonarrId: series.ID,
-		Title:    series.Title,
-		Status:   "active",
+		TVDBId:    tvdbId,
+		SonarrId:  series.ID,
+		Title:     series.Title,
+		PosterURL: series.PosterURL(),
+		FanartURL: series.FanartURL(),
+		Status:    "active",
 	}
 	return h.shows.Upsert(show)
 }
 
-// isRewatching returns true if the user has watched all episodes of the show's
-// last season (indicating they are starting a rewatch cycle).
-func (h *Handler) isRewatching(tvdbId int, plexUserId string) bool {
+// isRewatching returns true when the user is requesting a season they have
+// already watched past. Specifically: if requestedSeason is less than the
+// user's highest watched season for this show, the new request is a rewatch.
+func (h *Handler) isRewatching(tvdbId int, plexUserId string, requestedSeason int) bool {
 	showKey, err := h.plex.FindShowByTVDB(tvdbId)
 	if err != nil {
 		return false // show not in Plex yet
 	}
 
-	history, err := h.plex.GetShowHistory(showKey)
+	var history []plex.WatchHistoryEntry
+	if strings.HasPrefix(plexUserId, "seerr:") {
+		history, err = h.plex.GetShowHistory(showKey)
+	} else {
+		accountId, _ := strconv.Atoi(plexUserId)
+		history, err = h.plex.GetAccountHistory(showKey, accountId)
+	}
 	if err != nil || len(history) == 0 {
 		return false
 	}
 
-	// Build highest watched episode per season.
-	highestPerSeason := make(map[int]int)
+	highestSeason := 0
 	for _, entry := range history {
-		if entry.SeasonNum <= 0 {
-			continue
-		}
-		if entry.EpisodeNum > highestPerSeason[entry.SeasonNum] {
-			highestPerSeason[entry.SeasonNum] = entry.EpisodeNum
+		if entry.SeasonNum > highestSeason {
+			highestSeason = entry.SeasonNum
 		}
 	}
 
-	if len(highestPerSeason) == 0 {
-		return false
-	}
-
-	// Find the highest season number.
-	lastSeason := 0
-	for s := range highestPerSeason {
-		if s > lastSeason {
-			lastSeason = s
-		}
-	}
-
-	// Fetch the total episode count for the last season from Sonarr.
-	show, err := h.shows.FindByTVDB(tvdbId)
-	if err != nil || show == nil {
-		return false
-	}
-	episodes, err := h.sonarr.GetEpisodes(show.SonarrId)
-	if err != nil {
-		return false
-	}
-
-	lastSeasonTotal := 0
-	for _, ep := range episodes {
-		if ep.SeasonNumber == lastSeason && ep.EpisodeNumber > lastSeasonTotal {
-			lastSeasonTotal = ep.EpisodeNumber
-		}
-	}
-
-	if lastSeasonTotal == 0 {
-		return false
-	}
-
-	return highestPerSeason[lastSeason] >= lastSeasonTotal
+	return requestedSeason < highestSeason
 }

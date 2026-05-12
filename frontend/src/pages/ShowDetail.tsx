@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Loader2, RefreshCw, Trash2, RotateCcw } from 'lucide-react';
+import { ArrowLeft, Loader2, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowDetail as ShowDetailType, UserRequest, Flag } from '../api/client';
 
@@ -79,73 +79,123 @@ export function ShowDetail() {
   }
 
   const s = STATUS_BADGE[show.status] ?? STATUS_BADGE.inactive;
-  const seasons = Object.keys(show.expected_state).map(Number).sort((a, b) => a - b);
+  const requests = show.requests ?? [];
+  const openFlags = show.open_flags ?? [];
+  const expectedState = show.expected_state ?? {};
+  const allEpisodes = show.all_episodes ?? {};
+  // Only show seasons that are actively managed (appear in expected_state)
+  const seasons = Object.keys(expectedState).map(Number).sort((a, b) => a - b);
 
   return (
     <div className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
-      {/* Back button */}
-      <button
-        onClick={() => navigate('/')}
-        style={{
-          width: 32, height: 32, borderRadius: 'var(--radius-inner)',
-          border: '1px solid var(--color-glass-border)',
-          background: 'var(--color-glass-bg-light)',
-          cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
-          color: 'var(--color-text-muted)', alignSelf: 'flex-start',
-        }}
-      >
-        <ArrowLeft size={15} />
-      </button>
+      {/* Hero header — fanart background if available */}
+      <div style={{
+        position: 'relative',
+        borderRadius: 'var(--radius-card)',
+        overflow: 'hidden',
+        minHeight: show.fanart_url ? 180 : 'auto',
+      }}>
+        {/* Fanart background */}
+        {show.fanart_url && (
+          <div style={{
+            position: 'absolute', inset: 0,
+            backgroundImage: `url(${show.fanart_url})`,
+            backgroundSize: 'cover', backgroundPosition: 'center top',
+            filter: 'brightness(0.35) saturate(0.8)',
+          }} />
+        )}
 
-      {/* Header */}
-      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16, flexWrap: 'wrap' }}>
-        <div>
-          <h1 style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--color-text-primary)', lineHeight: 1.2, marginBottom: 10 }}>
-            {show.title}
-          </h1>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{
-              fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
-              borderRadius: 'var(--radius-pill)', background: s.bg, border: `1px solid ${s.border}`, color: s.color,
-            }}>
-              {show.status}
-            </span>
-            <span style={{
-              fontSize: '0.72rem', color: 'var(--color-text-muted)',
-              background: 'var(--color-glass-bg-light)', border: '1px solid var(--color-glass-border)',
-              padding: '2px 8px', borderRadius: 4, fontVariantNumeric: 'tabular-nums',
-            }}>
-              Buffer: {show.effective_buffer_size} episodes
-            </span>
-            <span style={{
-              fontSize: '0.72rem', color: 'var(--color-text-muted)',
-              background: 'var(--color-glass-bg-light)', border: '1px solid var(--color-glass-border)',
-              padding: '2px 8px', borderRadius: 4,
-            }}>
-              {show.active_request_count} active request{show.active_request_count !== 1 ? 's' : ''}
-            </span>
+        {/* Gradient overlay so text is always readable */}
+        {show.fanart_url && (
+          <div style={{
+            position: 'absolute', inset: 0,
+            background: 'linear-gradient(to right, rgba(10,10,15,0.85) 0%, rgba(10,10,15,0.4) 60%, transparent 100%)',
+          }} />
+        )}
+
+        {/* Content */}
+        <div style={{
+          position: 'relative',
+          display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between',
+          gap: 16, flexWrap: 'wrap',
+          padding: show.fanart_url ? '20px 20px 20px 20px' : '0',
+        }}>
+          {/* Left: back + title */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <button
+              onClick={() => navigate('/')}
+              style={{
+                width: 32, height: 32, borderRadius: 'var(--radius-inner)',
+                border: '1px solid var(--color-glass-border)',
+                background: 'var(--color-glass-bg-light)',
+                cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                color: 'var(--color-text-muted)', alignSelf: 'flex-start',
+              }}
+            >
+              <ArrowLeft size={15} />
+            </button>
+            <div>
+              <h1 style={{ fontSize: '1.5rem', fontWeight: 800, color: 'var(--color-text-primary)', lineHeight: 1.2, marginBottom: 10 }}>
+                {show.title}
+              </h1>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                <span style={{
+                  fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
+                  borderRadius: 'var(--radius-pill)', background: s.bg, border: `1px solid ${s.border}`, color: s.color,
+                }}>
+                  {show.status}
+                </span>
+                <span style={{
+                  fontSize: '0.72rem', color: 'var(--color-text-muted)',
+                  background: 'var(--color-glass-bg-light)', border: '1px solid var(--color-glass-border)',
+                  padding: '2px 8px', borderRadius: 4, fontVariantNumeric: 'tabular-nums',
+                }}>
+                  Buffer: {show.effective_buffer_size} episodes
+                </span>
+                <span style={{
+                  fontSize: '0.72rem', color: 'var(--color-text-muted)',
+                  background: 'var(--color-glass-bg-light)', border: '1px solid var(--color-glass-border)',
+                  padding: '2px 8px', borderRadius: 4,
+                }}>
+                  {show.active_request_count} active request{show.active_request_count !== 1 ? 's' : ''}
+                </span>
+              </div>
+            </div>
           </div>
-        </div>
 
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          {reconcileToast && (
-            <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>{reconcileToast}</span>
-          )}
-          <button
-            onClick={handleReconcile}
-            disabled={reconciling}
-            style={{
-              display: 'inline-flex', alignItems: 'center', gap: 6,
-              padding: '0 14px', height: 32, borderRadius: 'var(--radius-pill)',
-              border: '1px solid var(--color-glass-border)',
-              background: 'var(--color-glass-bg)', cursor: reconciling ? 'not-allowed' : 'pointer',
-              color: 'var(--color-text-secondary)', fontSize: '0.8rem', fontWeight: 600,
-              opacity: reconciling ? 0.6 : 1,
-            }}
-          >
-            <RefreshCw size={13} style={{ animation: reconciling ? 'spin 0.8s linear infinite' : 'none' }} />
-            Reconcile Now
-          </button>
+          {/* Right: poster + reconcile */}
+          <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+            {show.poster_url && (
+              <img
+                src={show.poster_url}
+                alt={show.title}
+                style={{
+                  width: 72, borderRadius: 6, boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+                  display: 'block',
+                }}
+              />
+            )}
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 8 }}>
+              {reconcileToast && (
+                <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>{reconcileToast}</span>
+              )}
+              <button
+                onClick={handleReconcile}
+                disabled={reconciling}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '0 14px', height: 32, borderRadius: 'var(--radius-pill)',
+                  border: '1px solid var(--color-glass-border)',
+                  background: 'var(--color-glass-bg)', cursor: reconciling ? 'not-allowed' : 'pointer',
+                  color: 'var(--color-text-secondary)', fontSize: '0.8rem', fontWeight: 600,
+                  opacity: reconciling ? 0.6 : 1,
+                }}
+              >
+                <RefreshCw size={13} style={{ animation: reconciling ? 'spin 0.8s linear infinite' : 'none' }} />
+                Reconcile Now
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -154,7 +204,7 @@ export function ShowDetail() {
         <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)' }}>
           <span className="section-title">User Requests</span>
         </div>
-        {show.requests.length === 0 ? (
+        {requests.length === 0 ? (
           <div style={{ padding: '20px', color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>
             No user requests.
           </div>
@@ -162,17 +212,56 @@ export function ShowDetail() {
           <table className="ep-table" style={{ width: '100%' }}>
             <thead>
               <tr>
-                <th>Plex User ID</th>
+                <th>User</th>
+                <th>Progress</th>
+                <th>Buffer window</th>
                 <th>Requested At</th>
                 <th>Rewatching</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
-              {show.requests.map((req) => (
+              {requests.map((req) => {
+                const s = req.last_watched_season;
+                const e = req.last_watched_episode;
+                const watched = s != null && e != null
+                  ? `S${String(s).padStart(2,'0')}E${String(e).padStart(2,'0')}`
+                  : null;
+                const nextEp = e != null ? e + 1 : 1;
+                const nextSeason = s != null ? s : 1;
+                const bufEnd = nextEp + show.effective_buffer_size - 1;
+                const bufferLabel = watched
+                  ? `S${String(nextSeason).padStart(2,'0')}E${String(nextEp).padStart(2,'0')}–E${String(bufEnd).padStart(2,'0')}`
+                  : `S01E01–E${String(show.effective_buffer_size).padStart(2,'0')}`;
+                return (
                 <tr key={req.plex_user_id}>
-                  <td style={{ fontFamily: 'monospace', fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
-                    {req.plex_user_id}
+                  <td style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+                    {req.display_name || req.plex_user_id}
+                  </td>
+                  <td>
+                    {watched ? (
+                      <span style={{
+                        fontSize: '0.75rem', fontWeight: 700,
+                        fontVariantNumeric: 'tabular-nums',
+                        color: 'var(--color-accent-green)',
+                      }}>
+                        {watched}
+                      </span>
+                    ) : (
+                      <span style={{ color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>Not started</span>
+                    )}
+                  </td>
+                  <td>
+                    <span style={{
+                      fontSize: '0.72rem', fontWeight: 600,
+                      fontVariantNumeric: 'tabular-nums',
+                      color: 'var(--color-accent-orange)',
+                      background: 'rgba(249,115,22,0.1)',
+                      border: '1px solid rgba(249,115,22,0.25)',
+                      padding: '2px 7px', borderRadius: 4,
+                    }}>
+                      {bufferLabel}
+                    </span>
                   </td>
                   <td style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
                     {formatDate(req.request_timestamp)}
@@ -217,7 +306,8 @@ export function ShowDetail() {
                     </button>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         )}
@@ -235,7 +325,11 @@ export function ShowDetail() {
         ) : (
           <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
             {seasons.map((season) => {
-              const episodes = show.expected_state[season] ?? [];
+              const buffered = new Set(expectedState[season] ?? []);
+              const allEps = allEpisodes[season] ?? [];
+              // Merge: all known eps + any buffered eps not yet in Sonarr data
+              const epSet = new Set([...allEps, ...(expectedState[season] ?? [])]);
+              const epList = Array.from(epSet).sort((a, b) => a - b);
               return (
                 <div key={season} style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
                   <span style={{
@@ -246,20 +340,26 @@ export function ShowDetail() {
                     Season {String(season).padStart(2, '0')}
                   </span>
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                    {episodes.map((ep) => (
-                      <span
-                        key={ep}
-                        style={{
-                          padding: '2px 7px', borderRadius: 4,
-                          background: 'rgba(249,115,22,0.15)', border: '1px solid rgba(249,115,22,0.3)',
-                          fontSize: '0.68rem', fontWeight: 700, color: 'var(--color-accent-orange)',
-                          fontVariantNumeric: 'tabular-nums',
-                        }}
-                      >
-                        E{String(ep).padStart(2, '0')}
-                      </span>
-                    ))}
-                    {episodes.length === 0 && (
+                    {epList.map((ep) => {
+                      const inBuffer = buffered.has(ep);
+                      return (
+                        <span
+                          key={ep}
+                          style={{
+                            padding: '2px 7px', borderRadius: 4,
+                            background: inBuffer ? 'rgba(249,115,22,0.15)' : 'rgba(255,255,255,0.04)',
+                            border: `1px solid ${inBuffer ? 'rgba(249,115,22,0.3)' : 'rgba(255,255,255,0.08)'}`,
+                            fontSize: '0.68rem', fontWeight: 700,
+                            color: inBuffer ? 'var(--color-accent-orange)' : 'var(--color-text-muted)',
+                            fontVariantNumeric: 'tabular-nums',
+                            opacity: inBuffer ? 1 : 0.5,
+                          }}
+                        >
+                          E{String(ep).padStart(2, '0')}
+                        </span>
+                      );
+                    })}
+                    {epList.length === 0 && (
                       <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>None</span>
                     )}
                   </div>
@@ -275,7 +375,7 @@ export function ShowDetail() {
         <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)' }}>
           <span className="section-title">Open Flags</span>
         </div>
-        {show.open_flags.length === 0 ? (
+        {openFlags.length === 0 ? (
           <div style={{ padding: '20px', color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>
             No open flags.
           </div>
@@ -290,7 +390,7 @@ export function ShowDetail() {
               </tr>
             </thead>
             <tbody>
-              {show.open_flags.map((flag) => (
+              {openFlags.map((flag) => (
                 <OpenFlagRow key={flag.id} flag={flag} />
               ))}
             </tbody>

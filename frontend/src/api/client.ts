@@ -1,4 +1,11 @@
 // Types
+export interface UserBufferInfo {
+  display_name: string;
+  season: number;
+  buffer_start: number;
+  buffer_end: number;
+}
+
 export interface ShowSummary {
   tvdb_id: number;
   sonarr_id: number;
@@ -7,13 +14,19 @@ export interface ShowSummary {
   effective_buffer_size: number;
   active_request_count: number;
   last_activity_at: string | null;
+  poster_url: string;
+  fanart_url: string;
+  user_buffers: UserBufferInfo[];
 }
 
 export interface UserRequest {
   plex_user_id: string;
+  display_name: string;
   tvdb_id: number;
   request_timestamp: string;
   is_rewatching: boolean;
+  last_watched_season: number | null;
+  last_watched_episode: number | null;
 }
 
 export interface Flag {
@@ -29,6 +42,7 @@ export interface Flag {
 export interface ShowDetail extends ShowSummary {
   requests: UserRequest[];
   expected_state: Record<number, number[]>;
+  all_episodes: Record<number, number[]>;
   open_flags: Flag[];
 }
 

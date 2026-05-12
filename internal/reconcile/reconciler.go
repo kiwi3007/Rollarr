@@ -3,6 +3,8 @@ package reconcile
 import (
 	"fmt"
 	"log"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
@@ -19,6 +21,7 @@ type Reconciler struct {
 	flags    *repository.DiscrepancyFlagRepository
 	sonarr   *sonarr.Client
 	plex     *plex.Client
+	plexdb   *plex.PlexDB // may be nil
 	engine   *state.Engine
 }
 
@@ -29,6 +32,7 @@ func NewReconciler(
 	flags *repository.DiscrepancyFlagRepository,
 	sonarrClient *sonarr.Client,
 	plexClient *plex.Client,
+	plexDB *plex.PlexDB,
 	engine *state.Engine,
 ) *Reconciler {
 	return &Reconciler{
@@ -37,6 +41,7 @@ func NewReconciler(
 		flags:    flags,
 		sonarr:   sonarrClient,
 		plex:     plexClient,
+		plexdb:   plexDB,
 		engine:   engine,
 	}
 }
@@ -55,10 +60,33 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		return fmt.Errorf("reconcile(%d): show not found", tvdbId)
 	}
 
-	// 1. Compute expected state.
-	expected, err := r.engine.ComputeExpectedState(tvdbId)
+	// 1a. Auto-discover watchers who started playing without a Seerr request.
+	if showKey, err := r.plex.FindShowByTVDB(tvdbId); err == nil {
+		r.discoverNewWatchers(show, showKey)
+	}
+
+	// 1. Compute expected state and per-user progress.
+	stateResult, err := r.engine.Compute(tvdbId)
 	if err != nil {
 		return fmt.Errorf("reconcile(%d): compute expected: %w", tvdbId, err)
+	}
+	expected := stateResult.Expected
+
+	// Persist per-user watch progress so the UI can display it.
+	for plexUserID, seasons := range stateResult.UserProgress {
+		// Find the highest season then highest episode in that season.
+		bestSeason, bestEp := 0, 0
+		for season, ep := range seasons {
+			if season > bestSeason || (season == bestSeason && ep > bestEp) {
+				bestSeason = season
+				bestEp = ep
+			}
+		}
+		if bestSeason > 0 {
+			if err := r.requests.UpdateWatchProgress(tvdbId, plexUserID, bestSeason, bestEp); err != nil {
+				log.Printf("[reconcile] tvdb=%d update progress for %s: %v", tvdbId, plexUserID, err)
+			}
+		}
 	}
 
 	// 2. Fetch actual episodes from Sonarr.
@@ -80,25 +108,35 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	// Build index of actual episodes by (season, episode).
 	// actualWithFile: episodes that have a file on disk.
 	type episodeInfo struct {
-		id     int
-		fileId int
+		id        int
+		fileId    int
+		monitored bool
 	}
 	actualWithFile := make(map[epKey]episodeInfo)
 	// episodesByKey: all episodes for monitor/search lookup.
 	episodesByKey := make(map[epKey]episodeInfo)
 	for _, ep := range episodes {
 		k := epKey{ep.SeasonNumber, ep.EpisodeNumber}
-		episodesByKey[k] = episodeInfo{id: ep.ID, fileId: ep.EpisodeFileId}
+		episodesByKey[k] = episodeInfo{id: ep.ID, fileId: ep.EpisodeFileId, monitored: ep.Monitored}
 		if ep.HasFile {
-			actualWithFile[k] = episodeInfo{id: ep.ID, fileId: ep.EpisodeFileId}
+			actualWithFile[k] = episodeInfo{id: ep.ID, fileId: ep.EpisodeFileId, monitored: ep.Monitored}
 		}
 	}
 
-	// 4. Compute missing: expected but no file.
+	// 4. Compute missing: expected, no file, not queued.
+	queuedIDs, err := r.sonarr.GetQueuedEpisodeIDs()
+	if err != nil {
+		log.Printf("[reconcile] tvdb=%d get queue: %v (skipping queue check)", tvdbId, err)
+		queuedIDs = map[int]bool{}
+	}
+
 	var missingIds []int
 	for k := range expectedSet {
 		if _, hasFile := actualWithFile[k]; !hasFile {
-			if info, ok := episodesByKey[k]; ok {
+			// Search regardless of monitored state: a previous cycle may have
+			// monitored the episode (step 7) without Sonarr successfully
+			// downloading it, leaving it stuck as monitored+no-file forever.
+			if info, ok := episodesByKey[k]; ok && !queuedIDs[info.id] {
 				missingIds = append(missingIds, info.id)
 			}
 		}
@@ -114,17 +152,14 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		}
 	}
 
-	// 5b. Unmonitor episodes outside the expected window so Sonarr's own
-	// scheduler doesn't download them between reconcile runs.
+	// 5b. Build the unmonitor list — applied AFTER file deletes (step 6) because
+	// Sonarr silently sets an episode back to monitored=true when its file is
+	// deleted via the API (to allow re-download). Unmonitoring before the delete
+	// would be immediately undone by Sonarr.
 	var toUnmonitor []int
 	for k, info := range episodesByKey {
 		if _, inExpected := expectedSet[k]; !inExpected {
 			toUnmonitor = append(toUnmonitor, info.id)
-		}
-	}
-	if len(toUnmonitor) > 0 {
-		if err := r.sonarr.MonitorEpisodes(toUnmonitor, false); err != nil {
-			log.Printf("[reconcile] tvdb=%d unmonitor out-of-window: %v", tvdbId, err)
 		}
 	}
 
@@ -137,11 +172,29 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		}
 	}
 
-	// 7. Monitor + search missing episodes.
-	if len(missingIds) > 0 {
-		if err := r.sonarr.MonitorEpisodes(missingIds, true); err != nil {
-			log.Printf("[reconcile] tvdb=%d monitor episodes: %v", tvdbId, err)
+	// 6b. Unmonitor out-of-window episodes now that deletes are done.
+	if len(toUnmonitor) > 0 {
+		if err := r.sonarr.MonitorEpisodes(toUnmonitor, false); err != nil {
+			log.Printf("[reconcile] tvdb=%d unmonitor out-of-window: %v", tvdbId, err)
 		}
+	}
+
+	// 7. Monitor ALL expected episodes, then search newly-entering ones.
+	// Monitoring all expected each cycle ensures Sonarr state stays consistent
+	// even if an episode was manually unmonitored or the flag drifted.
+	var allExpectedIds []int
+	for k, info := range episodesByKey {
+		if _, inExpected := expectedSet[k]; inExpected {
+			allExpectedIds = append(allExpectedIds, info.id)
+		}
+	}
+	if len(allExpectedIds) > 0 {
+		if err := r.sonarr.MonitorEpisodes(allExpectedIds, true); err != nil {
+			log.Printf("[reconcile] tvdb=%d monitor expected episodes: %v", tvdbId, err)
+		}
+	}
+
+	if len(missingIds) > 0 {
 		if err := r.sonarr.SearchEpisodes(missingIds); err != nil {
 			log.Printf("[reconcile] tvdb=%d search episodes: %v", tvdbId, err)
 			// Insert a discrepancy flag for each missing episode that couldn't be searched.
@@ -247,6 +300,79 @@ func (r *Reconciler) PruneInactive() error {
 		}
 	}
 	return nil
+}
+
+// discoverNewWatchers checks Plex history for account IDs not yet registered
+// in user_requests and creates a request row for each new watcher so they get
+// their own buffer window on the next ComputeExpectedState call.
+func (r *Reconciler) discoverNewWatchers(show *repository.Show, showKey string) {
+	// Collect account IDs from both the HTTP history API and the Plex SQLite DB.
+	// The HTTP API only includes scrobbled plays; the DB also covers "Mark as
+	// Watched" and is the sole source when HTTP history is empty (common on
+	// managed home accounts).
+	seenAccountIDs := make(map[int]bool)
+
+	if httpEntries, err := r.plex.GetShowHistory(showKey); err == nil {
+		for _, e := range httpEntries {
+			if e.AccountID > 0 {
+				seenAccountIDs[e.AccountID] = true
+			}
+		}
+	}
+
+	if r.plexdb != nil {
+		if marked, err := r.plexdb.GetMarkedWatched(showKey, 0); err == nil {
+			for _, m := range marked {
+				if m.AccountID > 0 {
+					seenAccountIDs[m.AccountID] = true
+				}
+			}
+		}
+	}
+
+	if len(seenAccountIDs) == 0 {
+		return
+	}
+
+	existing, err := r.requests.FindByShow(show.TVDBId)
+	if err != nil {
+		log.Printf("[reconcile] discoverNewWatchers tvdb=%d: load requests: %v", show.TVDBId, err)
+		return
+	}
+
+	knownIDs := make(map[int]bool, len(existing))
+	for _, req := range existing {
+		if !strings.HasPrefix(req.PlexUserID, "seerr:") {
+			if id, err := strconv.Atoi(req.PlexUserID); err == nil && id > 0 {
+				knownIDs[id] = true
+			}
+		}
+	}
+
+	for accountID := range seenAccountIDs {
+		if knownIDs[accountID] {
+			continue
+		}
+		req := repository.UserRequest{
+			PlexUserID:       strconv.Itoa(accountID),
+			TVDBId:           show.TVDBId,
+			RequestTimestamp: time.Now(),
+			IsRewatching:     false,
+		}
+		if err := r.requests.Upsert(req); err != nil {
+			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: upsert accountId=%d: %v", show.TVDBId, accountID, err)
+		} else {
+			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: registered new watcher accountId=%d", show.TVDBId, accountID)
+		}
+	}
+
+	// Drop unresolved seerr: rows whenever numeric accounts exist for this show —
+	// numeric rows are the resolved form; seerr: rows are deferred placeholders.
+	if len(seenAccountIDs) > 0 {
+		if err := r.requests.DeleteSeerrRows(show.TVDBId); err != nil {
+			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: delete seerr rows: %v", show.TVDBId, err)
+		}
+	}
 }
 
 // updateLastActivity fetches the most recent Plex watch event for the show and

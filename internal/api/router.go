@@ -11,8 +11,11 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/kiwi3007/rollarr/internal/db/repository"
+	"github.com/kiwi3007/rollarr/internal/plex"
 	"github.com/kiwi3007/rollarr/internal/reconcile"
 	"github.com/kiwi3007/rollarr/internal/scheduler"
+	"github.com/kiwi3007/rollarr/internal/sonarr"
+	"github.com/kiwi3007/rollarr/internal/state"
 )
 
 // NewRouter assembles the full chi router for the admin API and SPA fallback.
@@ -25,6 +28,9 @@ func NewRouter(
 	queue *scheduler.JobQueue,
 	token string,
 	frontendFS embed.FS,
+	engine *state.Engine,
+	sonarrClient *sonarr.Client,
+	plexClient *plex.Client,
 ) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
@@ -33,17 +39,21 @@ func NewRouter(
 	r.Group(func(r chi.Router) {
 		r.Use(bearerAuth(token))
 
-		showsH := &showsHandler{shows: shows, requests: requests, flags: flags, engine: nil, reconciler: reconciler, queue: queue}
+		showsH := &showsHandler{shows: shows, requests: requests, flags: flags, engine: engine, sonarr: sonarrClient, plex: plexClient, reconciler: reconciler, queue: queue}
 		r.Get("/api/shows", showsH.list)
 		r.Get("/api/shows/{tvdbId}", showsH.detail)
 		r.Post("/api/shows/{tvdbId}/reconcile", showsH.reconcile)
 
 		reqsH := &requestsHandler{requests: requests}
+		r.Patch("/api/shows/{tvdbId}/requests/{plexUserId}", reqsH.patchRequest)
 		r.Delete("/api/shows/{tvdbId}/requests/{plexUserId}", reqsH.deleteRequest)
 
 		flagsH := &flagsHandler{flags: flags}
 		r.Get("/api/flags", flagsH.listOpen)
 		r.Put("/api/flags/{id}", flagsH.updateStatus)
+
+		logsH := &logsHandler{}
+		r.Get("/api/logs", logsH.tail)
 
 		settingsH := &settingsHandler{settings: settings}
 		r.Get("/api/settings", settingsH.get)

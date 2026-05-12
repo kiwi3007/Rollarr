@@ -12,6 +12,7 @@ type Show struct {
 	SonarrId             int
 	Title                string
 	PosterURL            string
+	FanartURL            string
 	Status               string // active|inactive|removed
 	CustomBufferSize     *int
 	CustomInactivityDays *int
@@ -33,12 +34,12 @@ func NewShowRepository(db *sql.DB, settings *SettingsRepository) *ShowRepository
 // scanShow reads a Show from a sql.Row or sql.Rows.
 func scanShow(scan func(...interface{}) error) (*Show, error) {
 	var s Show
-	var posterURL sql.NullString
+	var posterURL, fanartURL sql.NullString
 	var customBuf, customInact sql.NullInt64
 	var lastActivity sql.NullTime
 
 	err := scan(
-		&s.TVDBId, &s.SonarrId, &s.Title, &posterURL,
+		&s.TVDBId, &s.SonarrId, &s.Title, &posterURL, &fanartURL,
 		&s.Status, &customBuf, &customInact, &lastActivity, &s.CreatedAt,
 	)
 	if err != nil {
@@ -47,6 +48,9 @@ func scanShow(scan func(...interface{}) error) (*Show, error) {
 
 	if posterURL.Valid {
 		s.PosterURL = posterURL.String
+	}
+	if fanartURL.Valid {
+		s.FanartURL = fanartURL.String
 	}
 	if customBuf.Valid {
 		v := int(customBuf.Int64)
@@ -63,7 +67,7 @@ func scanShow(scan func(...interface{}) error) (*Show, error) {
 	return &s, nil
 }
 
-const showColumns = `tvdb_id, sonarr_id, title, poster_url, status,
+const showColumns = `tvdb_id, sonarr_id, title, poster_url, fanart_url, status,
 	custom_buffer_size, custom_inactivity_days, last_activity_at, created_at`
 
 // FindAll returns every row from the shows table.
@@ -134,18 +138,19 @@ func (r *ShowRepository) FindByStatus(status string) ([]Show, error) {
 func (r *ShowRepository) Upsert(s Show) error {
 	_, err := r.db.Exec(
 		`INSERT INTO shows
-			(tvdb_id, sonarr_id, title, poster_url, status,
+			(tvdb_id, sonarr_id, title, poster_url, fanart_url, status,
 			 custom_buffer_size, custom_inactivity_days, last_activity_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(tvdb_id) DO UPDATE SET
 			sonarr_id              = excluded.sonarr_id,
 			title                  = excluded.title,
 			poster_url             = excluded.poster_url,
+			fanart_url             = excluded.fanart_url,
 			status                 = excluded.status,
 			custom_buffer_size     = excluded.custom_buffer_size,
 			custom_inactivity_days = excluded.custom_inactivity_days,
 			last_activity_at       = excluded.last_activity_at`,
-		s.TVDBId, s.SonarrId, s.Title, nullString(s.PosterURL),
+		s.TVDBId, s.SonarrId, s.Title, nullString(s.PosterURL), nullString(s.FanartURL),
 		s.Status, nullIntPtr(s.CustomBufferSize), nullIntPtr(s.CustomInactivityDays),
 		nullTimePtr(s.LastActivityAt),
 	)

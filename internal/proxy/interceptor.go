@@ -60,7 +60,7 @@ type Interceptor struct {
 	shows       *repository.ShowRepository
 	engine      *state.Engine
 	cache       *episodeCache
-	OnSeriesAdd func(tvdbId int) // called after a successful POST /api/v3/series
+	OnSeriesAdd func(tvdbId int, requestedSeasons []int) // called after a successful POST /api/v3/series
 }
 
 // NewInterceptor constructs an Interceptor.
@@ -95,10 +95,11 @@ type commandBody struct {
 // SeriesAddResult holds context from an intercepted POST /api/v3/series so the
 // proxy can fire OnSeriesAdd after the reverse proxy completes.
 type SeriesAddResult struct {
-	ResponseWriter http.ResponseWriter
-	Request        *http.Request
-	TvdbId         int
-	Status         int // written by WriteHeader; 0 means 200 OK (default)
+	ResponseWriter   http.ResponseWriter
+	Request          *http.Request
+	TvdbId           int
+	RequestedSeasons []int // season numbers with monitored=true in the request body
+	Status           int   // written by WriteHeader; 0 means 200 OK (default)
 }
 
 func (r *SeriesAddResult) WriteHeader(code int) {
@@ -139,6 +140,22 @@ func (i *Interceptor) InterceptSeriesAdd(w http.ResponseWriter, r *http.Request)
 		_ = json.Unmarshal(raw, &tvdbId)
 	}
 
+	// Extract which seasons Overseerr requested (monitored=true).
+	var requestedSeasons []int
+	if raw, ok := body["seasons"]; ok {
+		var seasons []struct {
+			SeasonNumber int  `json:"seasonNumber"`
+			Monitored    bool `json:"monitored"`
+		}
+		if json.Unmarshal(raw, &seasons) == nil {
+			for _, s := range seasons {
+				if s.Monitored && s.SeasonNumber > 0 {
+					requestedSeasons = append(requestedSeasons, s.SeasonNumber)
+				}
+			}
+		}
+	}
+
 	addOpts := make(map[string]json.RawMessage)
 	if raw, ok := body["addOptions"]; ok {
 		_ = json.Unmarshal(raw, &addOpts)
@@ -146,22 +163,22 @@ func (i *Interceptor) InterceptSeriesAdd(w http.ResponseWriter, r *http.Request)
 	addOpts["searchForMissingEpisodes"] = json.RawMessage(`false`)
 	addOpts["searchForCutoffUnmetEpisodes"] = json.RawMessage(`false`)
 
-	log.Printf("[proxy] POST /api/v3/series tvdbId=%d intercepted: disabled searchForMissingEpisodes", tvdbId)
+	log.Printf("[proxy] POST /api/v3/series tvdbId=%d intercepted: disabled searchForMissingEpisodes, requestedSeasons=%v", tvdbId, requestedSeasons)
 
 	encoded, err := json.Marshal(addOpts)
 	if err != nil {
 		r.Body = io.NopCloser(bytes.NewReader(raw))
-		return &SeriesAddResult{ResponseWriter: w, Request: r, TvdbId: tvdbId}, false
+		return &SeriesAddResult{ResponseWriter: w, Request: r, TvdbId: tvdbId, RequestedSeasons: requestedSeasons}, false
 	}
 	body["addOptions"] = encoded
 
 	rewritten, err := rewriteBody(r, body)
 	if err != nil {
 		r.Body = io.NopCloser(bytes.NewReader(raw))
-		return &SeriesAddResult{ResponseWriter: w, Request: r, TvdbId: tvdbId}, false
+		return &SeriesAddResult{ResponseWriter: w, Request: r, TvdbId: tvdbId, RequestedSeasons: requestedSeasons}, false
 	}
 
-	return &SeriesAddResult{ResponseWriter: w, Request: rewritten, TvdbId: tvdbId}, false
+	return &SeriesAddResult{ResponseWriter: w, Request: rewritten, TvdbId: tvdbId, RequestedSeasons: requestedSeasons}, false
 }
 
 // InterceptMonitor handles PUT /api/v3/episode/monitor.

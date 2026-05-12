@@ -46,8 +46,24 @@ func NewEngine(
 	}
 }
 
+// StateResult holds the output of a state computation.
+type StateResult struct {
+	Expected     ExpectedState
+	UserProgress map[string]map[int]int // plexUserID → season → highestWatchedEp
+}
+
 // ComputeExpectedState returns the set of episodes that should exist on disk
-// for the show with the given TVDB ID.
+// for the show with the given TVDB ID. It is a convenience wrapper around
+// Compute that discards the per-user progress map.
+func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
+	result, err := e.Compute(tvdbId)
+	if err != nil {
+		return nil, err
+	}
+	return result.Expected, nil
+}
+
+// Compute returns both the expected episode set and per-user watch progress.
 //
 // Algorithm:
 //  1. Load all user_requests for the show.
@@ -58,10 +74,10 @@ func NewEngine(
 //  6. Union intervals per season across all users.
 //  7. Append exceptions: S01E01 always; E01 of every season with any request.
 //  8. Return deduplicated, sorted map.
-func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
+func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 	reqs, err := e.requests.FindByShow(tvdbId)
 	if err != nil {
-		return nil, fmt.Errorf("state.ComputeExpectedState(%d): load requests: %w", tvdbId, err)
+		return StateResult{}, fmt.Errorf("state.Compute(%d): load requests: %w", tvdbId, err)
 	}
 
 	bufferSize := e.shows.EffectiveBufferSize(tvdbId)
@@ -95,6 +111,18 @@ func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
 			}
 		}
 
+		// Merge with stored high-water mark so transient plexdb fluctuations can
+		// never shrink the window below what we've already recorded as watched.
+		if req.LastWatchedSeason != nil && req.LastWatchedEpisode != nil &&
+			*req.LastWatchedSeason > 0 && *req.LastWatchedEpisode > 0 {
+			s, ep := *req.LastWatchedSeason, *req.LastWatchedEpisode
+			if highest[s] < ep {
+				log.Printf("[state] tvdb=%d user=%s: live S%02dE%02d < stored S%02dE%02d, using stored as floor",
+					tvdbId, req.PlexUserID, s, highest[s], s, ep)
+				highest[s] = ep
+			}
+		}
+
 		perUserHighest[req.PlexUserID] = highest
 		log.Printf("[state] tvdb=%d user=%s highest=%v", tvdbId, req.PlexUserID, highest)
 	}
@@ -116,11 +144,32 @@ func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
 			intervalsBySeason[season] = append(intervalsBySeason[season], interval)
 		}
 
-		// If user has no history for a season that was requested, seed from E01.
+		// No live watch history — either a genuine first-watch or a transient
+		// Plex read failure. Prefer stored DB progress over the destructive seed
+		// path so a momentary plexdb lock doesn't orphan all in-progress episodes.
 		if len(highest) == 0 {
-			// Start from S01E01 if user has made a request but watched nothing.
-			interval := Interval{Start: 1, End: bufferSize}
-			intervalsBySeason[1] = append(intervalsBySeason[1], interval)
+			if req.LastWatchedSeason != nil && req.LastWatchedEpisode != nil &&
+				*req.LastWatchedSeason > 0 && *req.LastWatchedEpisode > 0 {
+				s, ep := *req.LastWatchedSeason, *req.LastWatchedEpisode
+				interval := Interval{
+					Start: ep + 1,
+					End:   ep + bufferSize,
+				}
+				if interval.Start < 1 {
+					interval.Start = 1
+				}
+				intervalsBySeason[s] = append(intervalsBySeason[s], interval)
+				log.Printf("[state] tvdb=%d user=%s: live history empty, using stored progress S%02dE%02d as fallback",
+					tvdbId, req.PlexUserID, s, ep)
+			} else {
+				// Truly no history — seed from the requested season's E01.
+				seedSeason := req.RequestedSeason
+				if seedSeason < 1 {
+					seedSeason = 1
+				}
+				interval := Interval{Start: 1, End: bufferSize}
+				intervalsBySeason[seedSeason] = append(intervalsBySeason[seedSeason], interval)
+			}
 		}
 	}
 
@@ -139,10 +188,16 @@ func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
 		result[season] = eps
 	}
 
-	// Exceptions: S01E01 is always included.
-	result[1] = addEpisode(result[1], 1)
+	// E01 of each user's requested season is always included.
+	for _, req := range reqs {
+		s := req.RequestedSeason
+		if s < 1 {
+			s = 1
+		}
+		result[s] = addEpisode(result[s], 1)
+	}
 
-	// E01 of every season that has any active request.
+	// E01 of every season with watch history is always kept.
 	seasonsWithRequests := collectSeasonsWithRequests(reqs, perUserHighest, bufferSize)
 	for season := range seasonsWithRequests {
 		result[season] = addEpisode(result[season], 1)
@@ -153,8 +208,8 @@ func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
 		result[season] = dedupSorted(eps)
 	}
 
-	log.Printf("[state] ComputeExpectedState tvdb=%d result: %v", tvdbId, result)
-	return result, nil
+	log.Printf("[state] Compute tvdb=%d result: %v", tvdbId, result)
+	return StateResult{Expected: result, UserProgress: perUserHighest}, nil
 }
 
 // fetchHistory retrieves watch history for a single user from both the Plex
@@ -162,10 +217,15 @@ func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
 // Results are filtered to the requesting user's account and, when rewatching,
 // to entries after the request timestamp.
 func (e *Engine) fetchHistory(showKey string, tvdbId int, req repository.UserRequest) ([]plex.WatchHistoryEntry, error) {
-	// Parse account ID from PlexUserID. "seerr:username" prefixes indicate the
-	// user wasn't found in Plex /accounts; fall back to all-accounts history.
 	accountId := 0
-	if !strings.HasPrefix(req.PlexUserID, "seerr:") {
+	if strings.HasPrefix(req.PlexUserID, "seerr:") {
+		// User wasn't resolved at webhook time. Re-attempt resolution now so
+		// that accounts added to Plex after the original request self-heal.
+		username := strings.TrimPrefix(req.PlexUserID, "seerr:")
+		if userMap, err := e.plex.BuildUserMap(); err == nil {
+			accountId = userMap[username]
+		}
+	} else {
 		accountId, _ = strconv.Atoi(req.PlexUserID)
 	}
 
@@ -173,11 +233,25 @@ func (e *Engine) fetchHistory(showKey string, tvdbId int, req repository.UserReq
 
 	var entries []plex.WatchHistoryEntry
 	var err error
+	var knownIDs map[int]bool // populated only for unresolved (seerr:) users
 
 	if accountId > 0 {
 		entries, err = e.plex.GetAccountHistory(showKey, accountId)
 	} else {
-		entries, err = e.plex.GetShowHistory(showKey)
+		// Account still unresolvable — fetch all-accounts history and filter to
+		// entries whose accountID does not match any other known user, so one
+		// user's progress doesn't contaminate another's window.
+		all, fetchErr := e.plex.GetShowHistory(showKey)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		knownIDs = e.knownAccountIDs()
+		for _, entry := range all {
+			if entry.AccountID == 0 || !knownIDs[entry.AccountID] {
+				entries = append(entries, entry)
+			}
+		}
+		err = nil
 	}
 	if err != nil {
 		return nil, err
@@ -186,6 +260,8 @@ func (e *Engine) fetchHistory(showKey string, tvdbId int, req repository.UserReq
 
 	// Merge "Mark as Watched" entries from the Plex SQLite DB. These are
 	// episodes marked directly in Plex without reaching the playback threshold.
+	// For unresolved (seerr:) users, apply the same knownIDs filter used for
+	// HTTP history — otherwise all accounts' plexdb rows bleed into this user.
 	if e.plexdb != nil {
 		marked, dbErr := e.plexdb.GetMarkedWatched(showKey, accountId)
 		if dbErr != nil {
@@ -193,6 +269,9 @@ func (e *Engine) fetchHistory(showKey string, tvdbId int, req repository.UserReq
 		} else {
 			log.Printf("[state] fetchHistory tvdb=%d plexdb marked-watched entries=%d", tvdbId, len(marked))
 			for _, mw := range marked {
+				if knownIDs != nil && knownIDs[mw.AccountID] {
+					continue // exclude other users' plexdb rows for seerr: fallback
+				}
 				entries = append(entries, plex.WatchHistoryEntry{
 					AccountID:  mw.AccountID,
 					SeasonNum:  mw.SeasonNum,
@@ -218,6 +297,21 @@ func (e *Engine) fetchHistory(showKey string, tvdbId int, req repository.UserReq
 	}
 	log.Printf("[state] fetchHistory tvdb=%d rewatch filter: %d → %d entries", tvdbId, len(entries), len(filtered))
 	return filtered, nil
+}
+
+// knownAccountIDs returns the set of numeric Plex account IDs currently stored
+// in user_requests. Used to exclude other users' history when an unresolved
+// (seerr:) user's entries can't be isolated by account ID.
+func (e *Engine) knownAccountIDs() map[int]bool {
+	userMap, err := e.plex.BuildUserMap()
+	if err != nil {
+		return map[int]bool{}
+	}
+	ids := make(map[int]bool, len(userMap))
+	for _, id := range userMap {
+		ids[id] = true
+	}
+	return ids
 }
 
 // collectSeasonsWithRequests returns the set of season numbers that are

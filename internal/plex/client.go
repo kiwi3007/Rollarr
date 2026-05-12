@@ -131,9 +131,16 @@ type video struct {
 
 // ---- Plex users XML types --------------------------------------------------
 
+// mediaContainerUsers parses plex.tv /api/users responses (<User> elements).
 type mediaContainerUsers struct {
-	XMLName xml.Name    `xml:"MediaContainer"`
-	Users   []plexUser  `xml:"User"`
+	XMLName xml.Name   `xml:"MediaContainer"`
+	Users   []plexUser `xml:"User"`
+}
+
+// mediaContainerAccounts parses local /accounts responses (<Account> elements).
+type mediaContainerAccounts struct {
+	XMLName  xml.Name     `xml:"MediaContainer"`
+	Accounts []plexAccount `xml:"Account"`
 }
 
 type plexUser struct {
@@ -141,6 +148,11 @@ type plexUser struct {
 	Name  string `xml:"name,attr"`  // Plex username (login name)
 	Title string `xml:"title,attr"` // display name
 	Email string `xml:"email,attr"`
+}
+
+type plexAccount struct {
+	ID   string `xml:"id,attr"`
+	Name string `xml:"name,attr"` // local account name (login / display)
 }
 
 // ---- Library search XML types ----------------------------------------------
@@ -274,16 +286,61 @@ func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
 	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
 }
 
-// GetUsers returns all Plex managed/home users visible to the server.
+// GetUsers returns all Plex managed/home users visible to the local server.
 func (c *Client) GetUsers() ([]PlexUser, error) {
-	var mc mediaContainerUsers
+	var mc mediaContainerAccounts
 	if err := c.getXML("/accounts", &mc); err != nil {
 		return nil, fmt.Errorf("plex.GetUsers: %w", err)
+	}
+
+	users := make([]PlexUser, 0, len(mc.Accounts))
+	for _, u := range mc.Accounts {
+		id, _ := strconv.Atoi(u.ID)
+		if id == 0 {
+			continue
+		}
+		users = append(users, PlexUser{
+			ID:       id,
+			Username: u.Name,
+		})
+	}
+	return users, nil
+}
+
+// GetPlexTVUsers fetches friend/shared-library users from the plex.tv cloud
+// API. These accounts are not returned by the local /accounts endpoint — their
+// IDs are plex.tv account IDs (large integers) and are used as accountID in
+// watch history entries for non-home users.
+func (c *Client) GetPlexTVUsers() ([]PlexUser, error) {
+	var mc mediaContainerUsers
+	// plex.tv cloud endpoint — absolute URL, not relative to BaseURL.
+	fullURL := "https://plex.tv/api/users?X-Plex-Token=" + url.QueryEscape(c.Token)
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("plex.GetPlexTVUsers: build request: %w", err)
+	}
+	req.Header.Set("Accept", "application/xml")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("plex.GetPlexTVUsers: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("plex.GetPlexTVUsers: status %d: %s", resp.StatusCode, body)
+	}
+	if err := xml.NewDecoder(resp.Body).Decode(&mc); err != nil {
+		return nil, fmt.Errorf("plex.GetPlexTVUsers: decode XML: %w", err)
 	}
 
 	users := make([]PlexUser, 0, len(mc.Users))
 	for _, u := range mc.Users {
 		id, _ := strconv.Atoi(u.ID)
+		if id == 0 {
+			continue
+		}
 		users = append(users, PlexUser{
 			ID:       id,
 			Username: u.Title,
@@ -294,28 +351,42 @@ func (c *Client) GetUsers() ([]PlexUser, error) {
 }
 
 // BuildUserMap returns a map of username → accountID for all Plex users.
-// Both the Plex display name (title) and login name (name) are indexed so
-// that either can resolve to the correct account ID. This is important for
-// the server owner/admin whose Seerr username may differ from their Plex
-// display name.
+// It merges the local /accounts list (managed home users) with the plex.tv
+// cloud user list (friend/shared-library users) so that both home and
+// non-home accounts resolve correctly. Both display name and login name are
+// indexed. A cloud lookup failure is non-fatal — local accounts are always
+// returned.
 func (c *Client) BuildUserMap() (map[string]int, error) {
-	var mc mediaContainerUsers
+	var mc mediaContainerAccounts
 	if err := c.getXML("/accounts", &mc); err != nil {
 		return nil, fmt.Errorf("plex.BuildUserMap: %w", err)
 	}
 
-	m := make(map[string]int, len(mc.Users)*2)
-	for _, u := range mc.Users {
+	m := make(map[string]int, len(mc.Accounts)*2)
+	for _, u := range mc.Accounts {
 		id, _ := strconv.Atoi(u.ID)
 		if id == 0 {
 			continue
 		}
-		if u.Title != "" {
-			m[u.Title] = id
-		}
-		if u.Name != "" && u.Name != u.Title {
+		if u.Name != "" {
 			m[u.Name] = id
 		}
 	}
+
+	// Merge plex.tv friend accounts. Failures are logged but non-fatal so that
+	// a cloud outage doesn't break resolution of local home users.
+	friends, err := c.GetPlexTVUsers()
+	if err != nil {
+		log.Printf("[plex] BuildUserMap: plex.tv friends lookup failed (non-fatal): %v", err)
+	}
+	for _, f := range friends {
+		if f.Username != "" {
+			m[f.Username] = f.ID
+		}
+		if f.Email != "" {
+			m[f.Email] = f.ID
+		}
+	}
+
 	return m, nil
 }

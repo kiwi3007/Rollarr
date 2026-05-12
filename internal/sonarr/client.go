@@ -19,12 +19,36 @@ type Client struct {
 	http    *http.Client
 }
 
+// SeriesImage is one entry in Sonarr's images array for a series.
+type SeriesImage struct {
+	CoverType string `json:"coverType"` // "poster", "fanart", "banner"
+	RemoteURL string `json:"remoteUrl"`
+}
+
 // Series represents a Sonarr series resource.
 type Series struct {
-	ID     int    `json:"id"`
-	Title  string `json:"title"`
-	TvdbId int    `json:"tvdbId"`
-	Poster string `json:"-"` // derived from images array if needed
+	ID     int           `json:"id"`
+	Title  string        `json:"title"`
+	TvdbId int           `json:"tvdbId"`
+	Images []SeriesImage `json:"images"`
+}
+
+func (s *Series) PosterURL() string {
+	for _, img := range s.Images {
+		if img.CoverType == "poster" && img.RemoteURL != "" {
+			return img.RemoteURL
+		}
+	}
+	return ""
+}
+
+func (s *Series) FanartURL() string {
+	for _, img := range s.Images {
+		if img.CoverType == "fanart" && img.RemoteURL != "" {
+			return img.RemoteURL
+		}
+	}
+	return ""
 }
 
 // Episode represents a Sonarr episode resource.
@@ -226,4 +250,26 @@ func (c *Client) GetQueue() ([]map[string]interface{}, error) {
 		return nil, err
 	}
 	return wrapper.Records, nil
+}
+
+// GetQueuedEpisodeIDs returns the set of episode IDs currently in the Sonarr
+// download queue (grabbed, downloading, or importing). Episodes in this set
+// should not be re-searched.
+func (c *Client) GetQueuedEpisodeIDs() (map[int]bool, error) {
+	var wrapper struct {
+		Records []struct {
+			EpisodeID int `json:"episodeId"`
+		} `json:"records"`
+	}
+	queueURL := "/api/v3/queue?" + url.Values{"pageSize": {"1000"}}.Encode()
+	if err := c.get(queueURL, &wrapper); err != nil {
+		return nil, err
+	}
+	ids := make(map[int]bool, len(wrapper.Records))
+	for _, r := range wrapper.Records {
+		if r.EpisodeID > 0 {
+			ids[r.EpisodeID] = true
+		}
+	}
+	return ids, nil
 }

@@ -43,11 +43,10 @@ func ResolvePlexDBPath(path string) (string, error) {
 
 // OpenPlexDB opens the Plex SQLite database at path in read-only WAL mode.
 func OpenPlexDB(path string) (*PlexDB, error) {
-	// immutable=1: skip WAL coordination entirely, read only the main DB file.
-	// Plex holds a write lock on the WAL; the pure-Go SQLite driver can't share
-	// the SHM file with it, which causes SQLITE_CORRUPT(11). We accept a
-	// slightly stale read in exchange for reliability.
-	dsn := fmt.Sprintf("file:%s?mode=ro&immutable=1", path)
+	// mode=ro allows the Go SQLite driver to read through the WAL, so recently
+	// marked-as-watched episodes are visible without waiting for a checkpoint.
+	// busy_timeout gives Plex up to 5 s to finish a checkpoint before we error.
+	dsn := fmt.Sprintf("file:%s?mode=ro&_pragma=busy_timeout%%3D5000", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open plex db %q: %w", path, err)
