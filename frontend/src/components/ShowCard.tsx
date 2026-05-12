@@ -1,24 +1,201 @@
-import { useState } from 'react';
+import { useState, useRef, useLayoutEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { RefreshCw, Users, Clock } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowSummary, UserBufferInfo } from '../api/client';
 
-const STATUS_BADGE: Record<string, { bg: string; border: string; color: string }> = {
-  active:   { bg: 'rgba(34,197,94,0.15)',  border: 'rgba(34,197,94,0.25)',  color: '#22c55e' },
-  inactive: { bg: 'rgba(245,158,11,0.15)', border: 'rgba(245,158,11,0.25)', color: '#f59e0b' },
-  removed:  { bg: 'rgba(239,68,68,0.15)',  border: 'rgba(239,68,68,0.25)',  color: '#ef4444' },
-};
+// ── User color system ──────────────────────────────────────────────────────────
+export const USER_COLORS = [
+  '#3b82f6', '#ef4444', '#22c55e', '#a855f7',
+  '#06b6d4', '#eab308', '#ec4899', '#f97316',
+  '#84cc16', '#14b8a6',
+];
 
+export function buildUserColorMap(shows: ShowSummary[]): Record<string, string> {
+  const map: Record<string, string> = {};
+  let idx = 0;
+  for (const show of shows) {
+    for (const buf of show.user_buffers ?? []) {
+      if (!(buf.display_name in map)) {
+        map[buf.display_name] = USER_COLORS[idx % USER_COLORS.length];
+        idx++;
+      }
+    }
+  }
+  return map;
+}
+
+const OVERFLOW_GREY = '#9ca3af';
+
+function stripeBg(colors: string[]): string {
+  if (colors.length === 1) return colors[0];
+  const slices = colors.length <= 2 ? colors : [colors[0], colors[1], OVERFLOW_GREY];
+  const stops: string[] = [];
+  const step = 100 / slices.length;
+  slices.forEach((c, i) => {
+    stops.push(`${c} ${i * step}%`);
+    stops.push(`${c} ${(i + 1) * step}%`);
+  });
+  return `linear-gradient(135deg, ${stops.join(', ')})`;
+}
+
+// ── WindowProgress ────────────────────────────────────────────────────────────
+interface WindowProgressProps {
+  seasonBuffers: UserBufferInfo[];   // buffers for the currently viewed season
+  allBuffers: UserBufferInfo[];      // all buffers across all seasons (for legend)
+  viewingSeason: number;
+  colorMap: Record<string, string>;
+  totalEpisodes?: number;            // use exact count if available; else estimates from buffers
+}
+
+export function WindowProgress({
+  seasonBuffers,
+  allBuffers,
+  viewingSeason,
+  colorMap,
+  totalEpisodes: providedTotal,
+}: WindowProgressProps) {
+  const stripRef = useRef<HTMLDivElement>(null);
+  const [perRow, setPerRow] = useState<number>(100);
+
+  const maxBufEnd = seasonBuffers.reduce((m, b) => Math.max(m, b.buffer_end), 0);
+  const totalEpisodes = providedTotal ?? Math.max(maxBufEnd + 3, 1);
+
+  useLayoutEffect(() => {
+    function measure() {
+      const el = stripRef.current;
+      if (!el) return;
+      const w = el.clientWidth;
+      if (!w) return;
+      const MIN_CELL = 28;
+      const GAP = 3;
+      const cap = Math.max(1, Math.floor((w + GAP) / (MIN_CELL + GAP)));
+      const fits = Math.min(totalEpisodes, cap);
+      const rows = Math.max(1, Math.ceil(totalEpisodes / fits));
+      setPerRow(Math.ceil(totalEpisodes / rows));
+    }
+    measure();
+    const ro = new ResizeObserver(measure);
+    if (stripRef.current) ro.observe(stripRef.current);
+    return () => ro.disconnect();
+  }, [totalEpisodes]);
+
+  const totalTrackers = seasonBuffers.length;
+
+  const cells = Array.from({ length: totalEpisodes }, (_, i) => {
+    const ep = i + 1;
+    // A user has "watched" ep if ep is before their buffer_start
+    const watchedBy = seasonBuffers.filter(b => ep < b.buffer_start);
+    const bufferingBy = seasonBuffers.filter(b => ep >= b.buffer_start && ep <= b.buffer_end);
+    return { ep, watchedBy, bufferingBy };
+  });
+
+  return (
+    <div>
+      <div
+        ref={stripRef}
+        className="ep-strip"
+        style={{ gridTemplateColumns: `repeat(${perRow}, minmax(0, 1fr))` }}
+      >
+        {cells.map(({ ep, watchedBy, bufferingBy }) => {
+          if (bufferingBy.length > 0) {
+            const colors = bufferingBy.map(b => colorMap[b.display_name] ?? '#f97316');
+            const bg = stripeBg(colors);
+            const names = bufferingBy.map(b => b.display_name).join(' + ');
+            return (
+              <div
+                key={ep}
+                className="ep-cell"
+                style={{
+                  background: bg,
+                  boxShadow: bufferingBy.length === 1
+                    ? `0 0 6px ${colors[0]}55, inset 0 0 0 1px ${colors[0]}80`
+                    : '0 0 6px rgba(255,255,255,0.15), inset 0 0 0 1px rgba(255,255,255,0.18)',
+                }}
+                title={`E${String(ep).padStart(2, '0')} · Buffered for ${names}`}
+              >
+                <span className="ep-cell-num">E{ep}</span>
+              </div>
+            );
+          }
+          const allWatched = totalTrackers > 0 && watchedBy.length === totalTrackers;
+          if (watchedBy.length > 0) {
+            return (
+              <div
+                key={ep}
+                className="ep-cell ep-watched"
+                style={{ opacity: allWatched ? 0.55 : 0.8 }}
+                title={`E${String(ep).padStart(2, '0')} · Watched`}
+              >
+                <span className="ep-cell-num muted">E{ep}</span>
+              </div>
+            );
+          }
+          if (viewingSeason === 1 && ep === 1) {
+            return (
+              <div key={ep} className="ep-cell ep-starter" title="E01 · Starter buffer (always kept)">
+                <span className="ep-cell-num">E1</span>
+              </div>
+            );
+          }
+          return (
+            <div key={ep} className="ep-cell ep-upcoming" title={`E${String(ep).padStart(2, '0')} · Upcoming`}>
+              <span className="ep-cell-num muted">E{ep}</span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* User legend pills */}
+      {allBuffers.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4, marginTop: 9 }}>
+          {allBuffers.map((buf) => {
+            const color = colorMap[buf.display_name] ?? '#f97316';
+            const onSeason = buf.season === viewingSeason;
+            const lastWatched = buf.buffer_start - 1;
+            const label = onSeason
+              ? (lastWatched > 0 ? `E${String(lastWatched).padStart(2, '0')}` : 'E00')
+              : `S${String(buf.season).padStart(2, '0')}E${String(lastWatched).padStart(2, '0')}`;
+            return (
+              <span
+                key={`${buf.display_name}-${buf.season}`}
+                title={`${buf.display_name} · S${String(buf.season).padStart(2, '0')}E${String(lastWatched).padStart(2, '0')}`}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 5,
+                  padding: '2px 8px 2px 3px', borderRadius: 'var(--radius-pill)',
+                  background: `${color}15`, border: `1px solid ${color}40`,
+                  fontSize: '0.62rem', fontWeight: 700, color,
+                  fontVariantNumeric: 'tabular-nums', cursor: 'default',
+                  opacity: onSeason ? 1 : 0.55,
+                }}
+              >
+                <span style={{
+                  width: 14, height: 14, borderRadius: '50%', background: color,
+                  display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: '0.5rem', fontWeight: 800, color: '#fff', flexShrink: 0,
+                }}>
+                  {buf.display_name.charAt(0).toUpperCase()}
+                </span>
+                {label}
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Show Poster ───────────────────────────────────────────────────────────────
 const POSTER_GRADIENTS = [
-  ['#1a1a2e','#16213e','#0f3460'],
-  ['#2d1b33','#3d1f4a','#1a0a2e'],
-  ['#0d1b2a','#1b2838','#243447'],
-  ['#1a2a1a','#1f3a2a','#0d2b1a'],
-  ['#2a1a0d','#3a2515','#1f1005'],
-  ['#1a0d2a','#2a1a3a','#150825'],
-  ['#0d2a2a','#1a3a3a','#082020'],
-  ['#2a1a1a','#3a2525','#200d0d'],
+  ['#1a1a2e', '#16213e', '#0f3460'],
+  ['#2d1b33', '#3d1f4a', '#1a0a2e'],
+  ['#0d1b2a', '#1b2838', '#243447'],
+  ['#1a2a1a', '#1f3a2a', '#0d2b1a'],
+  ['#2a1a0d', '#3a2515', '#1f1005'],
+  ['#1a0d2a', '#2a1a3a', '#150825'],
+  ['#0d2a2a', '#1a3a3a', '#082020'],
+  ['#2a1a1a', '#3a2525', '#200d0d'],
 ];
 
 function posterGradient(title: string): string {
@@ -31,6 +208,42 @@ function posterInitials(title: string): string {
   return title.split(' ').filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
 }
 
+function ShowPoster({ title, posterUrl }: { title: string; posterUrl?: string }) {
+  const [loaded, setLoaded] = useState(false);
+  const [errored, setErrored] = useState(false);
+  return (
+    <div className="show-poster">
+      {/* Gradient fallback always rendered beneath */}
+      <div
+        className="show-poster-placeholder"
+        style={{ background: posterGradient(title), position: 'absolute', inset: 0, minHeight: 160 }}
+      >
+        {(!loaded || errored) && posterInitials(title)}
+      </div>
+      {posterUrl && !errored && (
+        <img
+          src={posterUrl}
+          alt={title}
+          style={{
+            width: '100%', height: '100%', objectFit: 'cover', display: 'block',
+            opacity: loaded ? 1 : 0, transition: 'opacity 0.4s ease',
+            position: 'relative', zIndex: 1,
+          }}
+          onLoad={() => setLoaded(true)}
+          onError={() => setErrored(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Show Card ─────────────────────────────────────────────────────────────────
+const STATUS_BADGE: Record<string, { bg: string; border: string; color: string }> = {
+  active:   { bg: 'rgba(34,197,94,0.15)',  border: 'rgba(34,197,94,0.25)',  color: '#22c55e' },
+  inactive: { bg: 'rgba(245,158,11,0.15)', border: 'rgba(245,158,11,0.25)', color: '#f59e0b' },
+  removed:  { bg: 'rgba(239,68,68,0.15)',  border: 'rgba(239,68,68,0.25)',  color: '#ef4444' },
+};
+
 function relativeTime(iso: string | null): string {
   if (!iso) return 'Never';
   const diff = Date.now() - new Date(iso).getTime();
@@ -39,145 +252,38 @@ function relativeTime(iso: string | null): string {
   if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
-
-// Initials from a display name for the user label chip
-function nameInitials(name: string): string {
-  const parts = name.trim().split(/[\s._-]+/).filter(Boolean);
-  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
-  return name.slice(0, 2).toUpperCase();
-}
-
-// Build episode pill list for a single user's row.
-// Shows up to MAX_PILLS pills. Gray = before buffer_start, orange = buffer window.
-// Truncates early watched episodes with a count badge if > CONTEXT_BEFORE before buffer.
-const MAX_PILLS = 14;
-const CONTEXT_BEFORE = 2;
-
-interface EpPill {
-  ep: number;
-  inBuffer: boolean;
-}
-
-function buildEpPills(buf: UserBufferInfo): { pills: EpPill[]; skippedBefore: number } {
-  const bufferLen = buf.buffer_end - buf.buffer_start + 1;
-  const windowStart = Math.max(1, buf.buffer_start - CONTEXT_BEFORE);
-  const skippedBefore = windowStart - 1; // episodes before the window
-
-  // Total pills we'd show: CONTEXT_BEFORE gray + buffer
-  const totalInWindow = buf.buffer_end - windowStart + 1;
-  const visibleCount = Math.min(totalInWindow, MAX_PILLS);
-
-  // If buffer alone exceeds MAX_PILLS, show only first MAX_PILLS of buffer
-  const pills: EpPill[] = [];
-  const showStart = windowStart;
-  const showEnd = windowStart + visibleCount - 1;
-
-  for (let ep = showStart; ep <= showEnd; ep++) {
-    pills.push({ ep, inBuffer: ep >= buf.buffer_start && ep <= buf.buffer_end });
-  }
-
-  // Trim: if bufferLen > MAX_PILLS, only show first MAX_PILLS of buffer
-  if (bufferLen > MAX_PILLS) {
-    return {
-      pills: Array.from({ length: MAX_PILLS }, (_, i) => ({
-        ep: buf.buffer_start + i,
-        inBuffer: true,
-      })),
-      skippedBefore,
-    };
-  }
-
-  return { pills, skippedBefore };
-}
-
-interface UserBufferRowProps {
-  buf: UserBufferInfo;
-  colorIdx: number;
-}
-
-// Distinct orange shades per user index so multiple users are visually distinct
-const USER_COLORS = [
-  { bg: 'rgba(249,115,22,0.18)', border: 'rgba(249,115,22,0.35)', text: '#f97316' },
-  { bg: 'rgba(139,92,246,0.18)', border: 'rgba(139,92,246,0.35)', text: '#a78bfa' },
-  { bg: 'rgba(34,197,94,0.18)',  border: 'rgba(34,197,94,0.35)',  text: '#4ade80' },
-  { bg: 'rgba(236,72,153,0.18)', border: 'rgba(236,72,153,0.35)', text: '#f472b6' },
-];
-
-function UserBufferRow({ buf, colorIdx }: UserBufferRowProps) {
-  const color = USER_COLORS[colorIdx % USER_COLORS.length];
-  const { pills, skippedBefore } = buildEpPills(buf);
-
-  return (
-    <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, flexWrap: 'wrap' }}>
-      {/* User label */}
-      <span style={{
-        flexShrink: 0,
-        fontSize: '0.6rem', fontWeight: 700,
-        padding: '1px 5px', borderRadius: 3,
-        background: color.bg, border: `1px solid ${color.border}`, color: color.text,
-        alignSelf: 'center', whiteSpace: 'nowrap',
-        maxWidth: 64, overflow: 'hidden', textOverflow: 'ellipsis',
-      }} title={buf.display_name}>
-        {nameInitials(buf.display_name)}
-      </span>
-
-      {/* Skipped count badge */}
-      {skippedBefore > 0 && (
-        <span style={{
-          fontSize: '0.6rem', fontWeight: 600,
-          color: 'var(--color-text-muted)',
-          alignSelf: 'center', whiteSpace: 'nowrap',
-        }}>
-          +{skippedBefore}
-        </span>
-      )}
-
-      {/* Episode pills */}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
-        {pills.map(({ ep, inBuffer }) => (
-          <span
-            key={ep}
-            style={{
-              padding: '1px 5px', borderRadius: 3,
-              background: inBuffer ? color.bg : 'rgba(255,255,255,0.04)',
-              border: `1px solid ${inBuffer ? color.border : 'rgba(255,255,255,0.07)'}`,
-              fontSize: '0.6rem', fontWeight: 700,
-              color: inBuffer ? color.text : 'var(--color-text-muted)',
-              fontVariantNumeric: 'tabular-nums',
-              opacity: inBuffer ? 1 : 0.45,
-            }}
-          >
-            E{String(ep).padStart(2, '0')}
-          </span>
-        ))}
-      </div>
-    </div>
-  );
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 interface ShowCardProps {
   show: ShowSummary;
   delay?: number;
+  colorMap?: Record<string, string>;
   onReconcile?: () => void;
+  onHover?: (show: ShowSummary) => void;
+  onHoverEnd?: () => void;
 }
 
-export function ShowCard({ show, delay = 0, onReconcile }: ShowCardProps) {
+export function ShowCard({
+  show,
+  delay = 0,
+  colorMap = {},
+  onReconcile,
+  onHover,
+  onHoverEnd,
+}: ShowCardProps) {
   const navigate = useNavigate();
   const [reconciling, setReconciling] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
 
   const userBuffers = show.user_buffers ?? [];
 
-  // Distinct seasons from user buffers
+  // Unique seasons, in order
   const seasons = Array.from(new Set(userBuffers.map((b) => b.season))).sort((a, b) => a - b);
   const [activeSeason, setActiveSeason] = useState<number | null>(null);
+  const displaySeason = activeSeason ?? seasons[0] ?? 1;
 
-  const displaySeason = activeSeason ?? seasons[0] ?? null;
   const seasonBuffers = userBuffers.filter((b) => b.season === displaySeason);
-
   const s = STATUS_BADGE[show.status] ?? STATUS_BADGE.inactive;
 
   async function handleReconcile(e: React.MouseEvent) {
@@ -198,6 +304,8 @@ export function ShowCard({ show, delay = 0, onReconcile }: ShowCardProps) {
       className="show-card"
       style={{ animationDelay: `${delay}ms`, position: 'relative' }}
       onClick={() => navigate(`/shows/${show.tvdb_id}`)}
+      onMouseEnter={() => onHover?.(show)}
+      onMouseLeave={() => onHoverEnd?.()}
     >
       {show.status === 'active' && (
         <div className="active-dot" style={{ position: 'absolute', top: 12, right: 12 }} />
@@ -217,51 +325,62 @@ export function ShowCard({ show, delay = 0, onReconcile }: ShowCardProps) {
 
       <div style={{ display: 'flex', gap: 0, flex: 1, alignItems: 'stretch' }}>
         {/* Poster */}
-        <div className="show-poster">
-          {show.poster_url ? (
-            <img
-              src={show.poster_url}
-              alt={show.title}
-              style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-              onError={(e) => {
-                // Fallback to gradient placeholder on load error
-                const el = e.currentTarget;
-                el.style.display = 'none';
-                const parent = el.parentElement;
-                if (parent) {
-                  const fb = document.createElement('div');
-                  fb.className = 'show-poster-placeholder';
-                  fb.style.background = posterGradient(show.title);
-                  fb.textContent = posterInitials(show.title);
-                  parent.appendChild(fb);
-                }
-              }}
-            />
-          ) : (
-            <div
-              className="show-poster-placeholder"
-              style={{ background: posterGradient(show.title) }}
-            >
-              {posterInitials(show.title)}
-            </div>
-          )}
-        </div>
+        <ShowPoster title={show.title} posterUrl={show.poster_url} />
 
         {/* Right column */}
         <div style={{
           flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column',
-          justifyContent: 'space-between', padding: '14px 16px 14px 14px',
+          justifyContent: 'space-between', padding: '16px 16px 16px 14px',
         }}>
-          {/* Title + badges */}
-          <div style={{ marginBottom: 8 }}>
+          {/* Title + season pills + status */}
+          <div style={{ marginBottom: 10 }}>
             <div style={{
               fontWeight: 700, fontSize: '0.9rem', color: 'var(--color-text-primary)',
               overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-              lineHeight: 1.25, marginBottom: 5,
+              lineHeight: 1.25, marginBottom: 6,
             }}>
               {show.title}
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
+
+            <div
+              style={{ display: 'flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Season switcher pills */}
+              {seasons.map((sn) => {
+                const isActive = sn === displaySeason;
+                const trackersOnSeason = userBuffers.filter((b) => b.season === sn);
+                return (
+                  <button
+                    key={sn}
+                    onClick={(e) => { e.stopPropagation(); setActiveSeason(sn); }}
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 4,
+                      padding: '2px 8px', borderRadius: 'var(--radius-pill)',
+                      border: isActive ? '1px solid rgba(249,115,22,0.5)' : '1px solid var(--color-glass-border)',
+                      background: isActive ? 'rgba(249,115,22,0.15)' : 'var(--color-glass-bg-light)',
+                      color: isActive ? 'var(--color-accent-orange)' : 'var(--color-text-muted)',
+                      fontSize: '0.68rem', fontWeight: 700, cursor: 'pointer',
+                      transition: 'all 0.15s', fontVariantNumeric: 'tabular-nums',
+                    }}
+                  >
+                    S{String(sn).padStart(2, '0')}
+                    {trackersOnSeason.length > 0 && (
+                      <span style={{
+                        minWidth: 14, height: 14, padding: '0 3px',
+                        borderRadius: 'var(--radius-pill)',
+                        fontSize: '0.5rem', fontWeight: 800,
+                        background: isActive ? 'var(--color-accent-orange)' : 'rgba(255,255,255,0.15)',
+                        color: '#fff',
+                        display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+                      }}>
+                        {trackersOnSeason.length}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+
               <span style={{
                 fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
                 borderRadius: 'var(--radius-pill)',
@@ -269,55 +388,22 @@ export function ShowCard({ show, delay = 0, onReconcile }: ShowCardProps) {
               }}>
                 {show.status}
               </span>
-              <span style={{
-                fontSize: '0.68rem', fontWeight: 600,
-                background: 'var(--color-glass-bg-light)', border: '1px solid var(--color-glass-border)',
-                padding: '2px 7px', borderRadius: 4, color: 'var(--color-text-muted)',
-                fontVariantNumeric: 'tabular-nums',
-              }}>
-                buffer {show.effective_buffer_size}
-              </span>
             </div>
           </div>
 
-          {/* Season tabs + episode strips */}
+          {/* Episode strip */}
           {seasons.length > 0 && (
-            <div style={{ marginBottom: 8 }}>
-              {/* Season tabs — only show if multiple seasons */}
-              {seasons.length > 1 && (
-                <div
-                  style={{ display: 'flex', gap: 2, marginBottom: 6 }}
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  {seasons.map((s) => (
-                    <button
-                      key={s}
-                      onClick={(e) => { e.stopPropagation(); setActiveSeason(s); }}
-                      style={{
-                        padding: '1px 7px', borderRadius: 3, fontSize: '0.62rem', fontWeight: 700,
-                        border: '1px solid',
-                        borderColor: displaySeason === s ? 'rgba(249,115,22,0.4)' : 'var(--color-glass-border)',
-                        background: displaySeason === s ? 'rgba(249,115,22,0.12)' : 'transparent',
-                        color: displaySeason === s ? '#f97316' : 'var(--color-text-muted)',
-                        cursor: 'pointer',
-                      }}
-                    >
-                      S{String(s).padStart(2, '0')}
-                    </button>
-                  ))}
-                </div>
-              )}
-
-              {/* Per-user buffer rows */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {seasonBuffers.map((buf, idx) => (
-                  <UserBufferRow key={buf.display_name} buf={buf} colorIdx={idx} />
-                ))}
-              </div>
+            <div style={{ marginBottom: 10 }}>
+              <WindowProgress
+                seasonBuffers={seasonBuffers}
+                allBuffers={userBuffers}
+                viewingSeason={displaySeason}
+                colorMap={colorMap}
+              />
             </div>
           )}
 
-          {/* Meta + reconcile */}
+          {/* Footer */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <span style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: '0.72rem', color: 'var(--color-text-muted)' }}>
@@ -346,15 +432,17 @@ export function ShowCard({ show, delay = 0, onReconcile }: ShowCardProps) {
               }}
               onMouseEnter={(e) => {
                 if (!reconciling) {
-                  (e.currentTarget as HTMLButtonElement).style.background = 'rgba(249,115,22,0.15)';
-                  (e.currentTarget as HTMLButtonElement).style.color = 'var(--color-accent-orange)';
-                  (e.currentTarget as HTMLButtonElement).style.borderColor = 'rgba(249,115,22,0.3)';
+                  const b = e.currentTarget as HTMLButtonElement;
+                  b.style.background = 'rgba(249,115,22,0.15)';
+                  b.style.color = 'var(--color-accent-orange)';
+                  b.style.borderColor = 'rgba(249,115,22,0.3)';
                 }
               }}
               onMouseLeave={(e) => {
-                (e.currentTarget as HTMLButtonElement).style.background = 'var(--color-glass-bg-light)';
-                (e.currentTarget as HTMLButtonElement).style.color = 'var(--color-text-muted)';
-                (e.currentTarget as HTMLButtonElement).style.borderColor = 'var(--color-glass-border)';
+                const b = e.currentTarget as HTMLButtonElement;
+                b.style.background = 'var(--color-glass-bg-light)';
+                b.style.color = 'var(--color-text-muted)';
+                b.style.borderColor = 'var(--color-glass-border)';
               }}
             >
               <RefreshCw size={11} style={{ animation: reconciling ? 'spin 0.8s linear infinite' : 'none' }} />

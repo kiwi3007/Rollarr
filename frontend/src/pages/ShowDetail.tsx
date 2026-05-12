@@ -1,8 +1,10 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useContext, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Loader2, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowDetail as ShowDetailType, UserRequest, Flag } from '../api/client';
+import { WindowProgress, buildUserColorMap } from '../components/ShowCard';
+import { BackdropContext } from '../context/BackdropContext';
 
 const STATUS_BADGE: Record<string, { bg: string; border: string; color: string }> = {
   active:   { bg: 'rgba(34,197,94,0.15)',  border: 'rgba(34,197,94,0.25)',  color: '#22c55e' },
@@ -28,6 +30,8 @@ export function ShowDetail() {
   const [reconciling, setReconciling] = useState(false);
   const [reconcileToast, setReconcileToast] = useState<string | null>(null);
 
+  const { setBackdrop } = useContext(BackdropContext);
+
   const load = useCallback(async () => {
     try {
       const data = await api.getShow(tvdbIdNum);
@@ -40,6 +44,13 @@ export function ShowDetail() {
   }, [tvdbIdNum]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Set backdrop to fanart when detail is open
+  useEffect(() => {
+    if (show?.fanart_url) setBackdrop(show.fanart_url);
+    else if (show?.poster_url) setBackdrop(show.poster_url);
+    return () => setBackdrop(null);
+  }, [show, setBackdrop]);
 
   async function handleReconcile() {
     setReconciling(true);
@@ -83,8 +94,11 @@ export function ShowDetail() {
   const openFlags = show.open_flags ?? [];
   const expectedState = show.expected_state ?? {};
   const allEpisodes = show.all_episodes ?? {};
-  // Only show seasons that are actively managed (appear in expected_state)
   const seasons = Object.keys(expectedState).map(Number).sort((a, b) => a - b);
+
+  // Build color map and convert requests → UserBufferInfo-like for WindowProgress
+  const colorMap = useMemo(() => buildUserColorMap([show]), [show]);
+  const userBuffers = show.user_buffers ?? [];
 
   return (
     <div className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -323,46 +337,27 @@ export function ShowDetail() {
             No expected state computed yet.
           </div>
         ) : (
-          <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 20 }}>
             {seasons.map((season) => {
-              const buffered = new Set(expectedState[season] ?? []);
-              const allEps = allEpisodes[season] ?? [];
-              // Merge: all known eps + any buffered eps not yet in Sonarr data
-              const epSet = new Set([...allEps, ...(expectedState[season] ?? [])]);
-              const epList = Array.from(epSet).sort((a, b) => a - b);
+              const epList = allEpisodes[season] ?? [];
+              const totalEps = epList.length || undefined;
+              const seasonBufs = userBuffers.filter((b) => b.season === season);
               return (
-                <div key={season} style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
-                  <span style={{
-                    flexShrink: 0, width: 64,
-                    fontSize: '0.75rem', fontWeight: 700, color: 'var(--color-text-muted)',
-                    fontVariantNumeric: 'tabular-nums', paddingTop: 2,
+                <div key={season}>
+                  <div style={{
+                    fontSize: '0.68rem', fontWeight: 700, letterSpacing: '0.08em',
+                    textTransform: 'uppercase', color: 'var(--color-text-muted)',
+                    marginBottom: 8,
                   }}>
                     Season {String(season).padStart(2, '0')}
-                  </span>
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                    {epList.map((ep) => {
-                      const inBuffer = buffered.has(ep);
-                      return (
-                        <span
-                          key={ep}
-                          style={{
-                            padding: '2px 7px', borderRadius: 4,
-                            background: inBuffer ? 'rgba(249,115,22,0.15)' : 'rgba(255,255,255,0.04)',
-                            border: `1px solid ${inBuffer ? 'rgba(249,115,22,0.3)' : 'rgba(255,255,255,0.08)'}`,
-                            fontSize: '0.68rem', fontWeight: 700,
-                            color: inBuffer ? 'var(--color-accent-orange)' : 'var(--color-text-muted)',
-                            fontVariantNumeric: 'tabular-nums',
-                            opacity: inBuffer ? 1 : 0.5,
-                          }}
-                        >
-                          E{String(ep).padStart(2, '0')}
-                        </span>
-                      );
-                    })}
-                    {epList.length === 0 && (
-                      <span style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>None</span>
-                    )}
                   </div>
+                  <WindowProgress
+                    seasonBuffers={seasonBufs}
+                    allBuffers={userBuffers}
+                    viewingSeason={season}
+                    colorMap={colorMap}
+                    totalEpisodes={totalEps}
+                  />
                 </div>
               );
             })}

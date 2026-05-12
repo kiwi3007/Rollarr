@@ -1,13 +1,16 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, useContext } from 'react';
 import { Loader2, Tv } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowSummary } from '../api/client';
-import { ShowCard } from '../components/ShowCard';
+import { ShowCard, buildUserColorMap } from '../components/ShowCard';
+import { BackdropContext } from '../context/BackdropContext';
 
 export function Dashboard() {
   const [shows, setShows] = useState<ShowSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const { setBackdrop } = useContext(BackdropContext);
+  const dashRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(async () => {
     try {
@@ -26,6 +29,43 @@ export function Dashboard() {
     return () => clearInterval(interval);
   }, [load]);
 
+  // Stable user→color map across all shows
+  const colorMap = useMemo(() => buildUserColorMap(shows), [shows]);
+
+  // Equalise all card heights to the tallest card per row
+  useEffect(() => {
+    const el = dashRef.current;
+    if (!el) return;
+    let busy = false;
+
+    function equalise() {
+      if (!el || busy) return;
+      busy = true;
+      const cards = [...el.querySelectorAll<HTMLElement>('.show-card')];
+      cards.forEach((c) => { c.style.minHeight = ''; });
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        const max = cards.reduce((m, c) => Math.max(m, c.offsetHeight), 0);
+        if (max > 0) cards.forEach((c) => { c.style.minHeight = max + 'px'; });
+        requestAnimationFrame(() => { busy = false; });
+      }));
+    }
+
+    const t = setTimeout(equalise, 400);
+    window.addEventListener('resize', equalise);
+
+    let ro: ResizeObserver | undefined;
+    if (window.ResizeObserver) {
+      ro = new ResizeObserver(equalise);
+      el.querySelectorAll<HTMLElement>('.show-card').forEach((c) => ro!.observe(c));
+    }
+
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener('resize', equalise);
+      ro?.disconnect();
+    };
+  }, [shows]);
+
   if (loading) {
     return (
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: 256 }}>
@@ -37,7 +77,7 @@ export function Dashboard() {
   if (error) {
     return (
       <div style={{
-        borderRadius: 'var(--radius-card)', padding: '24px',
+        borderRadius: 'var(--radius-card)', padding: 24,
         background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)',
         textAlign: 'center',
       }}>
@@ -91,7 +131,15 @@ export function Dashboard() {
           alignItems: 'stretch',
         }}>
           {items.map((show, i) => (
-            <ShowCard key={show.tvdb_id} show={show} delay={i * 60} onReconcile={load} />
+            <ShowCard
+              key={show.tvdb_id}
+              show={show}
+              delay={i * 60}
+              colorMap={colorMap}
+              onReconcile={load}
+              onHover={(s) => setBackdrop(s.fanart_url || s.poster_url || null)}
+              onHoverEnd={() => setBackdrop(null)}
+            />
           ))}
         </div>
       </section>
@@ -99,7 +147,7 @@ export function Dashboard() {
   }
 
   return (
-    <div className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
+    <div ref={dashRef} className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
         {[
@@ -123,7 +171,7 @@ export function Dashboard() {
 
       <Section label="Active"   color="var(--color-accent-green)"  items={active} />
       <Section label="Inactive" color="var(--color-accent-amber)"  items={inactive} opacity={0.75} />
-      <Section label="Removed"  color="#ef4444"                     items={removed}  opacity={0.6} />
+      <Section label="Removed"  color="#ef4444"                    items={removed}  opacity={0.6} />
     </div>
   );
 }
