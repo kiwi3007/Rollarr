@@ -4,6 +4,51 @@ import { api } from '../api/client';
 import type { ShowSummary } from '../api/client';
 import { ShowCard, buildUserColorMap } from '../components/ShowCard';
 import { BackdropContext } from '../context/BackdropContext';
+import { useSSE } from '../hooks/useSSE';
+
+interface SectionProps {
+  label: string;
+  color: string;
+  items: ShowSummary[];
+  opacity?: number;
+  colorMap: Record<string, string>;
+  onReconcile: () => void;
+  onHover: (s: ShowSummary) => void;
+  onHoverEnd: () => void;
+}
+
+function Section({ label, color, items, opacity = 1, colorMap, onReconcile, onHover, onHoverEnd }: SectionProps) {
+  if (items.length === 0) return null;
+  return (
+    <section>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+        <span style={{
+          display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
+          background: color, boxShadow: `0 0 6px ${color}`,
+        }} />
+        <span className="overline" style={{ color, letterSpacing: '0.1em' }}>{label}</span>
+      </div>
+      <div className="show-grid" style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
+        gap: 14, opacity,
+        alignItems: 'stretch',
+      }}>
+        {items.map((show, i) => (
+          <ShowCard
+            key={show.tvdb_id}
+            show={show}
+            delay={i * 60}
+            colorMap={colorMap}
+            onReconcile={onReconcile}
+            onHover={onHover}
+            onHoverEnd={onHoverEnd}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
 
 export function Dashboard() {
   const [shows, setShows] = useState<ShowSummary[]>([]);
@@ -25,12 +70,22 @@ export function Dashboard() {
 
   useEffect(() => {
     load();
+    // 30s fallback polling in case SSE connection drops
     const interval = setInterval(load, 30_000);
     return () => clearInterval(interval);
   }, [load]);
 
-  // Stable user→color map across all shows
+  useSSE(load);
+
   const colorMap = useMemo(() => buildUserColorMap(shows), [shows]);
+
+  const handleHover = useCallback((s: ShowSummary) => {
+    setBackdrop(s.fanart_url || s.poster_url || null);
+  }, [setBackdrop]);
+
+  const handleHoverEnd = useCallback(() => {
+    setBackdrop(null);
+  }, [setBackdrop]);
 
   // Equalise all card heights to the tallest card per row
   useEffect(() => {
@@ -111,41 +166,6 @@ export function Dashboard() {
     );
   }
 
-  function Section({
-    label, color, items, opacity = 1,
-  }: { label: string; color: string; items: ShowSummary[]; opacity?: number }) {
-    if (items.length === 0) return null;
-    return (
-      <section>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-          <span style={{
-            display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
-            background: color, boxShadow: `0 0 6px ${color}`,
-          }} />
-          <span className="overline" style={{ color, letterSpacing: '0.1em' }}>{label}</span>
-        </div>
-        <div style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
-          gap: 14, opacity,
-          alignItems: 'stretch',
-        }}>
-          {items.map((show, i) => (
-            <ShowCard
-              key={show.tvdb_id}
-              show={show}
-              delay={i * 60}
-              colorMap={colorMap}
-              onReconcile={load}
-              onHover={(s) => setBackdrop(s.fanart_url || s.poster_url || null)}
-              onHoverEnd={() => setBackdrop(null)}
-            />
-          ))}
-        </div>
-      </section>
-    );
-  }
-
   return (
     <div ref={dashRef} className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
       {/* Stats */}
@@ -169,9 +189,9 @@ export function Dashboard() {
         ))}
       </div>
 
-      <Section label="Active"   color="var(--color-accent-green)"  items={active} />
-      <Section label="Inactive" color="var(--color-accent-amber)"  items={inactive} opacity={0.75} />
-      <Section label="Removed"  color="#ef4444"                    items={removed}  opacity={0.6} />
+      <Section label="Active"   color="var(--color-accent-green)"  items={active}   colorMap={colorMap} onReconcile={load} onHover={handleHover} onHoverEnd={handleHoverEnd} />
+      <Section label="Inactive" color="var(--color-accent-amber)"  items={inactive} colorMap={colorMap} onReconcile={load} onHover={handleHover} onHoverEnd={handleHoverEnd} opacity={0.75} />
+      <Section label="Removed"  color="#ef4444"                    items={removed}  colorMap={colorMap} onReconcile={load} onHover={handleHover} onHoverEnd={handleHoverEnd} opacity={0.6} />
     </div>
   );
 }

@@ -21,6 +21,12 @@ type Interval struct {
 	End   int
 }
 
+// safetyBehind is how many episodes to retain *below* a user's highest-watched
+// mark. Plex records an episode as watched at a playback threshold (~90%),
+// before the user has actually finished it, so deleting at watched+1 can yank
+// the file mid-watch. Keeping this many behind the mark guards against that.
+const safetyBehind = 1
+
 // Engine computes the expected download state for a show based on user watch
 // progress and the configured buffer size.
 type Engine struct {
@@ -135,7 +141,7 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 		highest := perUserHighest[req.PlexUserID]
 		for season, ep := range highest {
 			interval := Interval{
-				Start: ep + 1,
+				Start: ep + 1 - safetyBehind,
 				End:   ep + bufferSize,
 			}
 			if interval.Start < 1 {
@@ -152,7 +158,7 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 				*req.LastWatchedSeason > 0 && *req.LastWatchedEpisode > 0 {
 				s, ep := *req.LastWatchedSeason, *req.LastWatchedEpisode
 				interval := Interval{
-					Start: ep + 1,
+					Start: ep + 1 - safetyBehind,
 					End:   ep + bufferSize,
 				}
 				if interval.Start < 1 {
@@ -284,19 +290,29 @@ func (e *Engine) fetchHistory(showKey string, tvdbId int, req repository.UserReq
 		log.Printf("[state] fetchHistory tvdb=%d plexdb=nil (not configured)", tvdbId)
 	}
 
-	if !req.IsRewatching {
-		return entries, nil
+	// For any Seerr-initiated request (RequestedSeason > 0), filter to entries
+	// viewed after the request timestamp. This prevents pre-request watch history
+	// in other seasons (e.g. previously-watched S6 when requesting S8) from
+	// creating spurious buffer windows and triggering download/delete loops.
+	// For rewatches this also applies, using the rewatch timestamp as the baseline.
+	// Auto-discovered watchers (RequestedSeason == 0) skip this filter so their
+	// existing watch progress is not discarded.
+	if req.RequestedSeason > 0 {
+		filtered := entries[:0]
+		for _, entry := range entries {
+			if entry.ViewedAt.After(req.RequestTimestamp) {
+				filtered = append(filtered, entry)
+			}
+		}
+		label := "timestamp"
+		if req.IsRewatching {
+			label = "rewatch"
+		}
+		log.Printf("[state] fetchHistory tvdb=%d %s filter: %d → %d entries", tvdbId, label, len(entries), len(filtered))
+		return filtered, nil
 	}
 
-	// Filter to entries viewed after the rewatch request was created.
-	filtered := entries[:0]
-	for _, entry := range entries {
-		if entry.ViewedAt.After(req.RequestTimestamp) {
-			filtered = append(filtered, entry)
-		}
-	}
-	log.Printf("[state] fetchHistory tvdb=%d rewatch filter: %d → %d entries", tvdbId, len(entries), len(filtered))
-	return filtered, nil
+	return entries, nil
 }
 
 // knownAccountIDs returns the set of numeric Plex account IDs currently stored

@@ -77,8 +77,12 @@ func main() {
 	// ── State engine ─────────────────────────────────────────────────────────
 	engine := state.NewEngine(shows, requests, plexClient, plexDB)
 
+	// ── SSE broker ───────────────────────────────────────────────────────────
+	broker := api.NewBroker()
+
 	// ── Job queue ────────────────────────────────────────────────────────────
 	queue := scheduler.NewJobQueue()
+	queue.SetNotify(broker.Notify)
 	queue.Start()
 
 	// ── Reconciler ───────────────────────────────────────────────────────────
@@ -173,7 +177,7 @@ func main() {
 	)
 
 	// ── API router ───────────────────────────────────────────────────────────
-	apiRouter := api.NewRouter(shows, requests, flags, settings, reconciler, queue, apiToken, rollarr.FrontendFS, engine, sonarrClient, plexClient)
+	apiRouter := api.NewRouter(shows, requests, flags, settings, reconciler, queue, apiToken, rollarr.FrontendFS, engine, sonarrClient, plexClient, broker)
 
 	// ── Root router ──────────────────────────────────────────────────────────
 	r := chi.NewRouter()

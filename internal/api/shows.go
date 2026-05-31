@@ -94,9 +94,19 @@ func buildIDToNameMap(plexClient *plex.Client) map[int]string {
 	if err != nil {
 		return idToName
 	}
+	// Two passes: usernames first, emails as fallback.
+	// BuildUserMap indexes both username and email to the same ID; Go map
+	// iteration is random so without priority the email can win.
 	for name, id := range userMap {
-		if _, exists := idToName[id]; !exists {
+		if !strings.Contains(name, "@") {
 			idToName[id] = name
+		}
+	}
+	for name, id := range userMap {
+		if strings.Contains(name, "@") {
+			if _, exists := idToName[id]; !exists {
+				idToName[id] = name
+			}
 		}
 	}
 	return idToName

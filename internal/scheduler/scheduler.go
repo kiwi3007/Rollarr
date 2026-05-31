@@ -12,7 +12,13 @@ import (
 // JobQueue serialises all background jobs through a single goroutine to prevent
 // concurrent Sonarr/Plex races.
 type JobQueue struct {
-	ch chan func()
+	ch       chan func()
+	notifyFn func()
+}
+
+// SetNotify registers a function called after each job completes.
+func (q *JobQueue) SetNotify(fn func()) {
+	q.notifyFn = fn
 }
 
 // NewJobQueue constructs a JobQueue with a buffer of 64 pending jobs.
@@ -33,6 +39,9 @@ func (q *JobQueue) Start() {
 				}()
 				job()
 				log.Printf("[queue] job completed in %s", time.Since(start))
+				if q.notifyFn != nil {
+					q.notifyFn()
+				}
 			}()
 		}
 	}()

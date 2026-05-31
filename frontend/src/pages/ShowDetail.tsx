@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useContext, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { useSSE } from '../hooks/useSSE';
 import { ArrowLeft, Loader2, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowDetail as ShowDetailType, UserRequest, Flag } from '../api/client';
@@ -44,6 +45,9 @@ export function ShowDetail() {
   }, [tvdbIdNum]);
 
   useEffect(() => { load(); }, [load]);
+  useSSE(load);
+
+  const colorMap = useMemo(() => (show ? buildUserColorMap([show]) : {}), [show]);
 
   // Set backdrop to fanart when detail is open
   useEffect(() => {
@@ -96,8 +100,6 @@ export function ShowDetail() {
   const allEpisodes = show.all_episodes ?? {};
   const seasons = Object.keys(expectedState).map(Number).sort((a, b) => a - b);
 
-  // Build color map and convert requests → UserBufferInfo-like for WindowProgress
-  const colorMap = useMemo(() => buildUserColorMap([show]), [show]);
   const userBuffers = show.user_buffers ?? [];
 
   return (
@@ -214,7 +216,7 @@ export function ShowDetail() {
       </div>
 
       {/* Section 1: User Requests */}
-      <div className="glass-card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="glass-card" style={{ padding: 0 }}>
         <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)' }}>
           <span className="section-title">User Requests</span>
         </div>
@@ -249,10 +251,10 @@ export function ShowDetail() {
                   : `S01E01–E${String(show.effective_buffer_size).padStart(2,'0')}`;
                 return (
                 <tr key={req.plex_user_id}>
-                  <td style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+                  <td data-label="User" style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)', fontWeight: 600 }}>
                     {req.display_name || req.plex_user_id}
                   </td>
-                  <td>
+                  <td data-label="Progress">
                     {watched ? (
                       <span style={{
                         fontSize: '0.75rem', fontWeight: 700,
@@ -265,7 +267,7 @@ export function ShowDetail() {
                       <span style={{ color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>Not started</span>
                     )}
                   </td>
-                  <td>
+                  <td data-label="Buffer">
                     <span style={{
                       fontSize: '0.72rem', fontWeight: 600,
                       fontVariantNumeric: 'tabular-nums',
@@ -277,10 +279,10 @@ export function ShowDetail() {
                       {bufferLabel}
                     </span>
                   </td>
-                  <td style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+                  <td data-label="Requested" style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
                     {formatDate(req.request_timestamp)}
                   </td>
-                  <td>
+                  <td data-label="Rewatching">
                     {req.is_rewatching ? (
                       <span style={{
                         fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
@@ -294,7 +296,7 @@ export function ShowDetail() {
                       <span style={{ color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>—</span>
                     )}
                   </td>
-                  <td style={{ textAlign: 'right' }}>
+                  <td data-label="" style={{ textAlign: 'right' }}>
                     <button
                       onClick={() => handleDeleteRequest(req)}
                       style={{
@@ -328,7 +330,7 @@ export function ShowDetail() {
       </div>
 
       {/* Section 2: Expected State */}
-      <div className="glass-card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="glass-card" style={{ padding: 0 }}>
         <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)' }}>
           <span className="section-title">Expected State</span>
         </div>
@@ -366,7 +368,7 @@ export function ShowDetail() {
       </div>
 
       {/* Section 3: Open Flags */}
-      <div className="glass-card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="glass-card" style={{ padding: 0 }}>
         <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)' }}>
           <span className="section-title">Open Flags</span>
         </div>
@@ -399,13 +401,13 @@ export function ShowDetail() {
 function OpenFlagRow({ flag }: { flag: Flag }) {
   return (
     <tr>
-      <td className="mono" style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
+      <td data-label="Episode ID" className="mono" style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
         {flag.sonarr_episode_id ?? '—'}
       </td>
-      <td style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
+      <td data-label="Description" style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
         {flag.issue_description}
       </td>
-      <td>
+      <td data-label="Status">
         <span style={{
           fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
           borderRadius: 'var(--radius-pill)',
@@ -416,7 +418,7 @@ function OpenFlagRow({ flag }: { flag: Flag }) {
           {flag.status}
         </span>
       </td>
-      <td style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+      <td data-label="Created" style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
         {new Date(flag.created_at).toLocaleDateString()}
       </td>
     </tr>

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { Loader2, Flag as FlagIcon, CheckCircle, XCircle } from 'lucide-react';
 import { api } from '../api/client';
 import type { Flag } from '../api/client';
+import { useSSE } from '../hooks/useSSE';
 
 function formatDate(iso: string): string {
   return new Date(iso).toLocaleString(undefined, {
@@ -28,6 +29,7 @@ export function FlagsPage() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useSSE(load);
 
   async function handleUpdate(id: number, status: 'resolved' | 'ignored') {
     setUpdating((prev) => new Set(prev).add(id));
@@ -75,7 +77,7 @@ export function FlagsPage() {
         </p>
       </div>
 
-      <div className="glass-card" style={{ padding: 0, overflow: 'hidden' }}>
+      <div className="glass-card" style={{ padding: 0 }}>
         <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)', display: 'flex', alignItems: 'center', gap: 8 }}>
           <FlagIcon size={14} style={{ color: openFlags.length > 0 ? '#ef4444' : 'var(--color-text-muted)' }} />
           <span className="section-title">
@@ -107,19 +109,19 @@ export function FlagsPage() {
                 const busy = updating.has(flag.id);
                 return (
                   <tr key={flag.id}>
-                    <td className="mono" style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+                    <td data-label="Show ID" className="mono" style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
                       {flag.tvdb_id}
                     </td>
-                    <td className="mono" style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
+                    <td data-label="Episode ID" className="mono" style={{ fontSize: '0.8rem', color: 'var(--color-text-muted)' }}>
                       {flag.sonarr_episode_id ?? '—'}
                     </td>
-                    <td style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
+                    <td data-label="Description" style={{ fontSize: '0.8rem', color: 'var(--color-text-secondary)' }}>
                       {flag.issue_description}
                     </td>
-                    <td style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+                    <td data-label="Created" style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)' }}>
                       {formatDate(flag.created_at)}
                     </td>
-                    <td>
+                    <td data-label="">
                       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                         <button
                           disabled={busy}

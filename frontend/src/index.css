@@ -393,3 +393,93 @@ input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin
 
 .page-enter { animation: glass-fade-in 0.25s ease-out both; }
 .spinner    { animation: spin 0.8s linear infinite; }
+
+/* ── Table scroll wrapper ── */
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* ── Mobile (≤640px) ── */
+@media (max-width: 640px) {
+  /* Sidebar becomes a bottom tab bar */
+  .sidebar {
+    top: auto;
+    left: 0; right: 0; bottom: 0;
+    width: 100%;
+    height: 56px;
+    flex-direction: row;
+    justify-content: space-around;
+    align-items: center;
+    padding: 0 8px;
+    border-right: none;
+    border-top: 1px solid var(--color-glass-border);
+    gap: 0;
+  }
+  .sidebar-logo { display: none; }
+  .sidebar-sep  { display: none; }
+  .glass-divider.mobile-hide { display: none; }
+
+  /* Nav items: fill row evenly, no active right-bar */
+  .nav-item {
+    flex: 1;
+    height: 48px;
+    border-radius: var(--radius-inner);
+  }
+  .nav-item.active::after,
+  .nav-item[aria-current="page"]::after { display: none; }
+
+  /* Tooltips make no sense on touch */
+  .nav-tooltip { display: none; }
+
+  /* Main content: remove left margin, add bottom clearance for nav bar */
+  .main-content {
+    margin-left: 0;
+    padding: 16px 16px 72px;
+  }
+
+  /* Stat cards: tighter padding */
+  .stat-card { padding: 14px 10px; }
+
+  /* Show card grid: single column */
+  .show-grid { grid-template-columns: 1fr !important; }
+
+  /* Responsive tables: stack rows vertically */
+  .ep-table thead { display: none; }
+  .ep-table,
+  .ep-table tbody,
+  .ep-table tr { display: block; }
+  .ep-table tr {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--color-glass-border);
+  }
+  .ep-table tr:last-child { border-bottom: none; }
+  .ep-table td {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 0;
+    border: none !important;
+    background: none !important;
+    font-size: 0.82rem;
+  }
+  .ep-table td[data-label]::before {
+    content: attr(data-label);
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--color-text-muted);
+    flex-shrink: 0;
+    margin-right: 12px;
+  }
+  .ep-table td[data-label=""]::before { display: none; }
+  .ep-table tr:hover td { background: none !important; }
+
+  /* Show card: hover lift disabled (touch doesn't hover) */
+  .show-card:hover { transform: none; }
+
+  /* Poster narrower on small screens */
+  .show-poster { width: 90px; }
+  .show-poster-placeholder { min-height: 0; }
+
+  /* ShowDetail hero: less padding */
+  .show-hero-content { padding: 14px !important; }
+}

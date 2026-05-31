@@ -31,6 +31,7 @@ func NewRouter(
 	engine *state.Engine,
 	sonarrClient *sonarr.Client,
 	plexClient *plex.Client,
+	broker *Broker,
 ) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.Recoverer)
@@ -54,6 +55,8 @@ func NewRouter(
 
 		logsH := &logsHandler{}
 		r.Get("/api/logs", logsH.tail)
+
+		r.Get("/api/events", broker.ServeHTTP)
 
 		settingsH := &settingsHandler{settings: settings}
 		r.Get("/api/settings", settingsH.get)
@@ -87,13 +90,14 @@ func bearerAuth(token string) func(http.Handler) http.Handler {
 			return next
 		}
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			auth := r.Header.Get("Authorization")
+			// Accept Bearer header or ?token= query param (EventSource can't set headers).
 			const prefix = "Bearer "
-			if !strings.HasPrefix(auth, prefix) {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
+			provided := ""
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, prefix) {
+				provided = auth[len(prefix):]
+			} else if t := r.URL.Query().Get("token"); t != "" {
+				provided = t
 			}
-			provided := auth[len(prefix):]
 			if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return

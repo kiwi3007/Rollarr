@@ -66,7 +66,7 @@ export default function App() {
         </div>
 
         <div style={{ padding: '0 8px', width: '100%' }}>
-          <hr className="glass-divider" style={{ marginBottom: 8 }} />
+          <hr className="glass-divider mobile-hide" style={{ marginBottom: 8 }} />
           <button
             className="nav-item"
             onClick={() => setIsDark((d) => !d)}
