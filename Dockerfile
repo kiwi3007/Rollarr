@@ -1,10 +1,15 @@
-# Stage 1: Build frontend
+# Stage 1: Build frontend (npm workspaces: shared + frontend)
 FROM node:20-alpine AS frontend-builder
-WORKDIR /app/frontend
-COPY frontend/package*.json ./
+WORKDIR /app
+# Lockfile + workspace manifests first for layer caching.
+COPY package.json package-lock.json ./
+COPY shared/package.json ./shared/
+COPY frontend/package.json ./frontend/
 RUN npm ci
-COPY frontend/ .
-RUN npm run build
+COPY shared/ ./shared/
+COPY frontend/ ./frontend/
+# shared must be compiled before frontend resolves @rollarr/shared.
+RUN npm run build -w shared && npm run build -w frontend
 
 # Stage 2: Build Go binary
 FROM golang:1.23-alpine AS go-builder
