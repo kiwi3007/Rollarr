@@ -3,7 +3,16 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { useSSE } from '../hooks/useSSE';
 import { ArrowLeft, Loader2, RefreshCw, Trash2 } from 'lucide-react';
 import { api } from '../api/client';
-import type { ShowDetail as ShowDetailType, UserRequest, Flag } from '../api/client';
+import type { ShowDetail as ShowDetailType, UserRequest, Flag, ShowEvent } from '../api/client';
+
+const EVENT_COLORS: Record<string, string> = {
+  deleted:     '#f87171',
+  searched:    'var(--color-accent-orange)',
+  discovered:  '#a78bfa',
+  onboarded:   'var(--color-accent-green)',
+  reactivated: 'var(--color-accent-green)',
+  pruned:      'var(--color-accent-amber)',
+};
 import { WindowProgress, buildUserColorMap } from '../components/ShowCard';
 import { BackdropContext } from '../context/BackdropContext';
 
@@ -96,6 +105,7 @@ export function ShowDetail() {
   const s = STATUS_BADGE[show.status] ?? STATUS_BADGE.inactive;
   const requests = show.requests ?? [];
   const openFlags = show.open_flags ?? [];
+  const events = show.events ?? [];
   const expectedState = show.expected_state ?? {};
   const allEpisodes = show.all_episodes ?? {};
   const seasons = Object.keys(expectedState).map(Number).sort((a, b) => a - b);
@@ -392,6 +402,42 @@ export function ShowDetail() {
               ))}
             </tbody>
           </table>
+        )}
+      </div>
+
+      {/* Section 4: Activity (audit trail) */}
+      <div className="glass-card" style={{ padding: 0 }}>
+        <div style={{ padding: '14px 20px', borderBottom: '1px solid var(--color-glass-border)' }}>
+          <span className="section-title">Activity</span>
+        </div>
+        {events.length === 0 ? (
+          <div style={{ padding: '20px', color: 'var(--color-text-muted)', fontSize: '0.85rem' }}>
+            No recorded activity yet.
+          </div>
+        ) : (
+          <div style={{ padding: '8px 0', maxHeight: 360, overflowY: 'auto' }}>
+            {events.map((ev: ShowEvent) => (
+              <div key={ev.id} style={{
+                display: 'flex', alignItems: 'baseline', gap: 10,
+                padding: '6px 20px', fontSize: '0.78rem',
+              }}>
+                <span className="mono" style={{
+                  color: 'var(--color-text-muted)', whiteSpace: 'nowrap',
+                  fontVariantNumeric: 'tabular-nums', fontSize: '0.72rem',
+                }}>
+                  {formatDate(ev.created_at)}
+                </span>
+                <span style={{
+                  fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em',
+                  fontSize: '0.66rem', whiteSpace: 'nowrap',
+                  color: EVENT_COLORS[ev.action] ?? 'var(--color-text-secondary)',
+                }}>
+                  {ev.action}
+                </span>
+                <span style={{ color: 'var(--color-text-secondary)' }}>{ev.detail}</span>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>

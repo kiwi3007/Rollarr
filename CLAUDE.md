@@ -46,7 +46,8 @@ internal/
   scheduler/           — cron + serial JobQueue (ALL jobs run through it; prevents races)
   proxy/               — reverse proxy to Sonarr; intercepts series-add, episode/monitor,
                          command (search) to scope Seerr's requests to the window
-  webhook/             — POST /webhooks/seerr and /webhooks/jellyseerr
+  webhook/             — POST /webhooks/seerr, /webhooks/jellyseerr (X-Webhook-Secret) and
+                         /webhooks/plex (media.scrobble → instant reconcile; ?secret= query param)
   api/                 — admin REST API (Bearer auth) + SSE + embedded SPA
 ```
 
@@ -63,6 +64,8 @@ internal/
 - Stored watch progress (`last_watched_season/episode`) is a forward-only floor; it is cleared when a rewatch starts (webhook or PATCH request API).
 - Unknown state must fail safe: Sonarr/Plex errors abort the reconcile before any delete; they never produce an empty expected state.
 - Everything that touches Sonarr/Plex runs through the serial `JobQueue`.
+- Every file delete goes through `Reconciler.deleteFileTracked`: it advances the savings counters (`stat_bytes_deleted`/`stat_files_deleted` in settings, exposed at `GET /api/stats`) and writes an `events` audit row explaining why. Don't call `sonarr.DeleteEpisodeFile` directly from reconcile paths.
+- The state engine depends on `PlexClient`/`PlexDBReader`/`SonarrClient` interfaces — scenario tests in `internal/state/engine_scenarios_test.go` use fakes + in-memory SQLite. New window-logic changes need a scenario test.
 
 ### Auth
 

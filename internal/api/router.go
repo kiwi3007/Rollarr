@@ -23,6 +23,7 @@ func NewRouter(
 	shows *repository.ShowRepository,
 	requests *repository.UserRequestRepository,
 	flags *repository.DiscrepancyFlagRepository,
+	events *repository.EventRepository,
 	settings *repository.SettingsRepository,
 	reconciler *reconcile.Reconciler,
 	queue *scheduler.JobQueue,
@@ -40,10 +41,17 @@ func NewRouter(
 	r.Group(func(r chi.Router) {
 		r.Use(bearerAuth(token))
 
-		showsH := &showsHandler{shows: shows, requests: requests, flags: flags, engine: engine, sonarr: sonarrClient, plex: plexClient, reconciler: reconciler, queue: queue}
+		showsH := &showsHandler{shows: shows, requests: requests, flags: flags, events: events, engine: engine, sonarr: sonarrClient, plex: plexClient, reconciler: reconciler, queue: queue}
 		r.Get("/api/shows", showsH.list)
 		r.Get("/api/shows/{tvdbId}", showsH.detail)
 		r.Post("/api/shows/{tvdbId}/reconcile", showsH.reconcile)
+
+		r.Get("/api/stats", func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, map[string]int64{
+				"bytes_deleted": settings.GetInt64("stat_bytes_deleted", 0),
+				"files_deleted": settings.GetInt64("stat_files_deleted", 0),
+			})
+		})
 
 		reqsH := &requestsHandler{requests: requests}
 		r.Patch("/api/shows/{tvdbId}/requests/{plexUserId}", reqsH.patchRequest)

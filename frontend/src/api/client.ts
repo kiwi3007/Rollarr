@@ -39,11 +39,25 @@ export interface Flag {
   updated_at: string;
 }
 
+export interface ShowEvent {
+  id: number;
+  tvdb_id: number;
+  action: string;
+  detail: string;
+  created_at: string;
+}
+
+export interface Stats {
+  bytes_deleted: number;
+  files_deleted: number;
+}
+
 export interface ShowDetail extends ShowSummary {
   requests: UserRequest[];
   expected_state: Record<number, number[]>;
   all_episodes: Record<number, number[]>;
   open_flags: Flag[];
+  events: ShowEvent[];
 }
 
 export type SettingsMap = Record<string, string>;
@@ -73,6 +87,7 @@ export const api = {
   getFlags: () => apiFetch<Flag[]>('/api/flags'),
   updateFlag: (id: number, status: 'resolved' | 'ignored') =>
     apiFetch<Flag>(`/api/flags/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),
+  getStats: () => apiFetch<Stats>('/api/stats'),
   getSettings: () => apiFetch<SettingsMap>('/api/settings'),
   saveSettings: (s: SettingsMap) => apiFetch<SettingsMap>('/api/settings', { method: 'PUT', body: JSON.stringify(s) }),
 };

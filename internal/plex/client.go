@@ -292,6 +292,47 @@ func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
 	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
 }
 
+// GetShowTVDBID resolves a show's Plex ratingKey to its TVDB ID by reading the
+// item's Guid array (modern agent) or primary guid (legacy agent). Used by the
+// Plex webhook, whose payload carries only the ratingKey.
+func (c *Client) GetShowTVDBID(ratingKey string) (int, error) {
+	key := strings.TrimPrefix(ratingKey, "/library/metadata/")
+
+	var resp struct {
+		MediaContainer struct {
+			Metadata []struct {
+				GUID string `json:"guid"`
+				Guid []struct {
+					ID string `json:"id"`
+				} `json:"Guid"`
+			} `json:"Metadata"`
+		} `json:"MediaContainer"`
+	}
+	if err := c.getJSON("/library/metadata/"+url.PathEscape(key)+"?includeGuids=1", &resp); err != nil {
+		return 0, fmt.Errorf("plex.GetShowTVDBID(%s): %w", ratingKey, err)
+	}
+	if len(resp.MediaContainer.Metadata) == 0 {
+		return 0, fmt.Errorf("plex.GetShowTVDBID(%s): no metadata", ratingKey)
+	}
+
+	md := resp.MediaContainer.Metadata[0]
+	for _, g := range md.Guid {
+		if rest, ok := strings.CutPrefix(g.ID, "tvdb://"); ok {
+			if id, err := strconv.Atoi(rest); err == nil && id > 0 {
+				return id, nil
+			}
+		}
+	}
+	// Legacy agent: com.plexapp.agents.thetvdb://121361?lang=en
+	if rest, ok := strings.CutPrefix(md.GUID, "com.plexapp.agents.thetvdb://"); ok {
+		rest, _, _ = strings.Cut(rest, "?")
+		if id, err := strconv.Atoi(rest); err == nil && id > 0 {
+			return id, nil
+		}
+	}
+	return 0, fmt.Errorf("plex.GetShowTVDBID(%s): no tvdb guid", ratingKey)
+}
+
 // GetUsers returns all Plex managed/home users visible to the local server.
 func (c *Client) GetUsers() ([]PlexUser, error) {
 	var mc mediaContainerAccounts

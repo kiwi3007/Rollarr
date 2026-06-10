@@ -33,6 +33,8 @@ type Reconciler struct {
 	shows    *repository.ShowRepository
 	requests *repository.UserRequestRepository
 	flags    *repository.DiscrepancyFlagRepository
+	settings *repository.SettingsRepository
+	events   *repository.EventRepository
 	sonarr   *sonarr.Client
 	plex     *plex.Client
 	plexdb   *plex.PlexDB // may be nil
@@ -47,6 +49,8 @@ func NewReconciler(
 	shows *repository.ShowRepository,
 	requests *repository.UserRequestRepository,
 	flags *repository.DiscrepancyFlagRepository,
+	settings *repository.SettingsRepository,
+	events *repository.EventRepository,
 	sonarrClient *sonarr.Client,
 	plexClient *plex.Client,
 	plexDB *plex.PlexDB,
@@ -56,12 +60,60 @@ func NewReconciler(
 		shows:         shows,
 		requests:      requests,
 		flags:         flags,
+		settings:      settings,
+		events:        events,
 		sonarr:        sonarrClient,
 		plex:          plexClient,
 		plexdb:        plexDB,
 		engine:        engine,
 		searchBackoff: make(map[int]searchAttempt),
 	}
+}
+
+// deleteFileTracked deletes an episode file, advances the savings counters,
+// and writes an audit event explaining why. Size lookup is best-effort.
+func (r *Reconciler) deleteFileTracked(tvdbId, fileId, season, episode int, reason string) error {
+	var size int64
+	if ef, err := r.sonarr.GetEpisodeFile(fileId); err == nil {
+		size = ef.Size
+	}
+	if err := r.sonarr.DeleteEpisodeFile(fileId); err != nil {
+		return err
+	}
+	if size > 0 {
+		if err := r.settings.AddInt64("stat_bytes_deleted", size); err != nil {
+			log.Printf("[reconcile] stat_bytes_deleted: %v", err)
+		}
+	}
+	if err := r.settings.AddInt64("stat_files_deleted", 1); err != nil {
+		log.Printf("[reconcile] stat_files_deleted: %v", err)
+	}
+	r.logEvent(tvdbId, "deleted", fmt.Sprintf("S%02dE%02d (%s) — %s", season, episode, formatBytes(size), reason))
+	return nil
+}
+
+// logEvent writes an audit event; failures are logged, never propagated.
+func (r *Reconciler) logEvent(tvdbId int, action, detail string) {
+	if err := r.events.Insert(tvdbId, action, detail); err != nil {
+		log.Printf("[reconcile] event insert: %v", err)
+	}
+}
+
+// formatBytes renders a byte count as a human-readable IEC size.
+func formatBytes(b int64) string {
+	if b <= 0 {
+		return "size unknown"
+	}
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 // searchAllowed reports whether the episode is past its backoff delay.
@@ -193,6 +245,7 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 
 	now := time.Now()
 	var missingIds []int
+	idToKey := make(map[int]epKey)
 	for k := range expectedSet {
 		if info, hasFile := actualWithFile[k]; hasFile {
 			r.clearSearchBackoff(info.id)
@@ -205,15 +258,19 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		// backoff so unfindable releases don't hammer indexers every cycle.
 		if info, ok := episodesByKey[k]; ok && !queuedIDs[info.id] && r.searchAllowed(info.id, now) {
 			missingIds = append(missingIds, info.id)
+			idToKey[info.id] = k
 		}
 	}
 
 	// 5. Compute orphaned: has file but not expected.
-	var orphanedFileIds []int
+	type orphan struct {
+		fileId, season, episode int
+	}
+	var orphans []orphan
 	for k, info := range actualWithFile {
 		if _, inExpected := expectedSet[k]; !inExpected {
 			if info.fileId > 0 {
-				orphanedFileIds = append(orphanedFileIds, info.fileId)
+				orphans = append(orphans, orphan{info.fileId, k.season, k.episode})
 			}
 		}
 	}
@@ -230,11 +287,11 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	}
 
 	// 6. Delete orphaned files.
-	for _, fileId := range orphanedFileIds {
-		if err := r.sonarr.DeleteEpisodeFile(fileId); err != nil {
-			log.Printf("[reconcile] tvdb=%d delete file %d: %v", tvdbId, fileId, err)
+	for _, o := range orphans {
+		if err := r.deleteFileTracked(tvdbId, o.fileId, o.season, o.episode, "outside all user windows"); err != nil {
+			log.Printf("[reconcile] tvdb=%d delete file %d: %v", tvdbId, o.fileId, err)
 		} else {
-			log.Printf("[reconcile] tvdb=%d deleted orphaned file %d", tvdbId, fileId)
+			log.Printf("[reconcile] tvdb=%d deleted orphaned file %d (S%02dE%02d)", tvdbId, o.fileId, o.season, o.episode)
 		}
 	}
 
@@ -282,6 +339,10 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 			}
 		} else {
 			log.Printf("[reconcile] tvdb=%d searched %d missing episodes", tvdbId, len(missingIds))
+			for _, epId := range missingIds {
+				k := idToKey[epId]
+				r.logEvent(tvdbId, "searched", fmt.Sprintf("S%02dE%02d — in window, no file on disk", k.season, k.episode))
+			}
 		}
 	}
 
@@ -289,7 +350,7 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	r.updateLastActivity(show)
 
 	log.Printf("[reconcile] tvdb=%d done in %s: %d unmonitored, %d missing searched, %d orphaned deleted",
-		tvdbId, time.Since(start), len(toUnmonitor), len(missingIds), len(orphanedFileIds))
+		tvdbId, time.Since(start), len(toUnmonitor), len(missingIds), len(orphans))
 	return nil
 }
 
@@ -365,11 +426,14 @@ func (r *Reconciler) PruneInactive() error {
 		}
 
 		var allIds []int
+		deleted := 0
 		for _, ep := range episodes {
 			allIds = append(allIds, ep.ID)
 			if ep.HasFile && ep.EpisodeFileId > 0 {
-				if err := r.sonarr.DeleteEpisodeFile(ep.EpisodeFileId); err != nil {
+				if err := r.deleteFileTracked(show.TVDBId, ep.EpisodeFileId, ep.SeasonNumber, ep.EpisodeNumber, "inactivity prune"); err != nil {
 					log.Printf("[reconcile] delete file %d for show %d: %v", ep.EpisodeFileId, show.TVDBId, err)
+				} else {
+					deleted++
 				}
 			}
 		}
@@ -383,6 +447,13 @@ func (r *Reconciler) PruneInactive() error {
 		if err := r.shows.UpdateStatus(show.TVDBId, "inactive"); err != nil {
 			log.Printf("[reconcile] update status %d: %v", show.TVDBId, err)
 		}
+		r.logEvent(show.TVDBId, "pruned",
+			fmt.Sprintf("no activity for %d+ days — removed %d files, series unmonitored", days, deleted))
+	}
+
+	// Keep the audit table bounded.
+	if err := r.events.PruneOlderThan(30); err != nil {
+		log.Printf("[reconcile] prune events: %v", err)
 	}
 	return nil
 }
@@ -452,6 +523,7 @@ func (r *Reconciler) discoverNewWatchers(show *repository.Show, showKey string) 
 			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: upsert accountId=%d: %v", show.TVDBId, accountID, err)
 		} else {
 			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: registered new watcher accountId=%d", show.TVDBId, accountID)
+			r.logEvent(show.TVDBId, "discovered", fmt.Sprintf("registered watcher accountId=%d from Plex history", accountID))
 		}
 	}
 

@@ -16,6 +16,7 @@ var migrations = []migration{
 	migration2,
 	migration3,
 	migration4,
+	migration5,
 }
 
 // migration0 creates the initial 4-table schema and seeds default settings.
@@ -148,6 +149,30 @@ func migration4(tx *sql.Tx) error {
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("migration4: %w", err)
+		}
+	}
+	return nil
+}
+
+// migration5 adds the events audit table (per-show record of every Sonarr op
+// and why it happened), savings counters, and the Plex webhook secret setting.
+func migration5(tx *sql.Tx) error {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS events (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			tvdb_id    INTEGER NOT NULL,
+			action     TEXT NOT NULL,
+			detail     TEXT NOT NULL DEFAULT '',
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_events_tvdb ON events(tvdb_id, id DESC)`,
+		`INSERT OR IGNORE INTO settings (key, value) VALUES ('plex_webhook_secret', '')`,
+		`INSERT OR IGNORE INTO settings (key, value) VALUES ('stat_bytes_deleted', '0')`,
+		`INSERT OR IGNORE INTO settings (key, value) VALUES ('stat_files_deleted', '0')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration5: %w", err)
 		}
 	}
 	return nil

@@ -50,6 +50,33 @@ func (r *SettingsRepository) GetInt(key string, def int) int {
 	return n
 }
 
+// GetInt64 returns the int64 value for the given key, or def on error/absence.
+func (r *SettingsRepository) GetInt64(key string, def int64) int64 {
+	val := r.Get(key)
+	if val == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(val, 10, 64)
+	if err != nil {
+		return def
+	}
+	return n
+}
+
+// AddInt64 atomically adds delta to a numeric counter setting. Safe under the
+// app's single-writer connection.
+func (r *SettingsRepository) AddInt64(key string, delta int64) error {
+	_, err := r.db.Exec(
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT)`,
+		key, strconv.FormatInt(delta, 10), delta,
+	)
+	if err != nil {
+		return fmt.Errorf("settings.AddInt64 %q: %w", key, err)
+	}
+	return nil
+}
+
 // Set writes a single key/value pair to the settings table.
 func (r *SettingsRepository) Set(key, value string) error {
 	_, err := r.db.Exec(

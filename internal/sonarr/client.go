@@ -64,10 +64,11 @@ type Episode struct {
 
 // EpisodeFile represents a Sonarr episode file resource.
 type EpisodeFile struct {
-	ID            int `json:"id"`
-	SeriesId      int `json:"seriesId"`
-	SeasonNumber  int `json:"seasonNumber"`
-	EpisodeNumber int `json:"episodeNumber"`
+	ID            int   `json:"id"`
+	SeriesId      int   `json:"seriesId"`
+	SeasonNumber  int   `json:"seasonNumber"`
+	EpisodeNumber int   `json:"episodeNumber"`
+	Size          int64 `json:"size"`
 }
 
 // NewClient constructs a Sonarr API client with a 30-second timeout.
@@ -229,6 +230,15 @@ func (c *Client) SearchEpisodes(episodeIds []int) error {
 		"episodeIds": episodeIds,
 	}
 	return c.post("/api/v3/command", body)
+}
+
+// GetEpisodeFile returns the episode file resource for the given file ID.
+func (c *Client) GetEpisodeFile(fileId int) (*EpisodeFile, error) {
+	var result EpisodeFile
+	if err := c.get(fmt.Sprintf("/api/v3/episodefile/%d", fileId), &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 // DeleteEpisodeFile deletes the episode file with the given ID from Sonarr.

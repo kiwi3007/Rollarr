@@ -86,24 +86,43 @@ func (l *layout) positionIndex(season, episode int) int {
 	return i - 1
 }
 
+// PlexClient is the subset of the Plex HTTP client the engine depends on.
+// Narrow interface so tests can substitute a fake.
+type PlexClient interface {
+	FindShowByTVDB(tvdbId int) (string, error)
+	GetShowHistory(showKey string) ([]plex.WatchHistoryEntry, error)
+	GetAccountHistory(showKey string, accountId int) ([]plex.WatchHistoryEntry, error)
+	BuildUserMap() (map[string]int, error)
+}
+
+// PlexDBReader is the subset of the Plex SQLite reader the engine depends on.
+type PlexDBReader interface {
+	GetMarkedWatched(plexRatingKey string, accountId int) ([]plex.MarkedWatched, error)
+}
+
+// SonarrClient is the subset of the Sonarr client the engine depends on.
+type SonarrClient interface {
+	GetEpisodes(seriesId int) ([]sonarr.Episode, error)
+}
+
 // Engine computes the expected download state for a show based on user watch
 // progress and the configured buffer size.
 type Engine struct {
 	shows    *repository.ShowRepository
 	requests *repository.UserRequestRepository
-	plex     *plex.Client
-	plexdb   *plex.PlexDB // may be nil
-	sonarr   *sonarr.Client
+	plex     PlexClient
+	plexdb   PlexDBReader // may be nil
+	sonarr   SonarrClient
 }
 
 // NewEngine constructs an Engine. plexDB may be nil if the Plex SQLite path is
-// not configured.
+// not configured — callers must pass a nil interface, not a typed nil pointer.
 func NewEngine(
 	shows *repository.ShowRepository,
 	requests *repository.UserRequestRepository,
-	plexClient *plex.Client,
-	plexDB *plex.PlexDB,
-	sonarrClient *sonarr.Client,
+	plexClient PlexClient,
+	plexDB PlexDBReader,
+	sonarrClient SonarrClient,
 ) *Engine {
 	return &Engine{
 		shows:    shows,

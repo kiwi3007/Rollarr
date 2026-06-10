@@ -46,6 +46,7 @@ func main() {
 	shows := repository.NewShowRepository(database, settings)
 	requests := repository.NewUserRequestRepository(database)
 	flags := repository.NewDiscrepancyFlagRepository(database)
+	events := repository.NewEventRepository(database)
 
 	// ── External clients (from settings; fall back gracefully if unconfigured) ─
 	sonarrURL := settings.GetWithDefault("sonarr_url", cfg.SonarrURL)
@@ -75,7 +76,12 @@ func main() {
 	}
 
 	// ── State engine ─────────────────────────────────────────────────────────
-	engine := state.NewEngine(shows, requests, plexClient, plexDB, sonarrClient)
+	// A typed-nil *plex.PlexDB must not be wrapped in a non-nil interface.
+	var plexDBReader state.PlexDBReader
+	if plexDB != nil {
+		plexDBReader = plexDB
+	}
+	engine := state.NewEngine(shows, requests, plexClient, plexDBReader, sonarrClient)
 
 	// ── SSE broker ───────────────────────────────────────────────────────────
 	broker := api.NewBroker()
@@ -86,7 +92,7 @@ func main() {
 	queue.Start()
 
 	// ── Reconciler ───────────────────────────────────────────────────────────
-	reconciler := reconcile.NewReconciler(shows, requests, flags, sonarrClient, plexClient, plexDB, engine)
+	reconciler := reconcile.NewReconciler(shows, requests, flags, settings, events, sonarrClient, plexClient, plexDB, engine)
 
 	// ── Scheduler ────────────────────────────────────────────────────────────
 	sched := scheduler.NewScheduler(reconciler, settings, queue)
@@ -156,6 +162,9 @@ func main() {
 			}
 
 			log.Printf("[proxy] onboard tvdb=%d (%s) upserted, reconciling", tvdbId, series.Title)
+			if err := events.Insert(tvdbId, "onboarded", fmt.Sprintf("%q added via Seerr, requested seasons %v", series.Title, requestedSeasons)); err != nil {
+				log.Printf("[proxy] onboard event: %v", err)
+			}
 
 			if err := reconciler.ReconcileShow(tvdbId); err != nil {
 				log.Printf("[proxy] onboard tvdb=%d reconcile error: %v", tvdbId, err)
@@ -179,14 +188,17 @@ func main() {
 	)
 
 	// ── API router ───────────────────────────────────────────────────────────
-	apiRouter := api.NewRouter(shows, requests, flags, settings, reconciler, queue, apiToken, rollarr.FrontendFS, engine, sonarrClient, plexClient, broker)
+	apiRouter := api.NewRouter(shows, requests, flags, events, settings, reconciler, queue, apiToken, rollarr.FrontendFS, engine, sonarrClient, plexClient, broker)
 
 	// ── Root router ──────────────────────────────────────────────────────────
 	r := chi.NewRouter()
 
-	// Webhooks (no Bearer auth — they use X-Webhook-Secret).
+	// Webhooks (no Bearer auth — Seerr uses X-Webhook-Secret, Plex an optional
+	// ?secret= query param).
 	r.Post("/webhooks/seerr", webhookHandler.ServeHTTP)
 	r.Post("/webhooks/jellyseerr", webhookHandler.ServeHTTP)
+	plexHandler := webhook.NewPlexHandler(plexClient, shows, settings, queue.Enqueue, reconciler.ReconcileShow)
+	r.Post("/webhooks/plex", plexHandler.ServeHTTP)
 
 	// Sonarr proxy — always registered; returns 503 with explanation if sonarr_url
 	// is not yet configured in Rollarr settings.

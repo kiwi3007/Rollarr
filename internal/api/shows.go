@@ -52,12 +52,14 @@ type ShowDetail struct {
 	ExpectedState map[int][]int                `json:"expected_state"`
 	AllEpisodes   map[int][]int                `json:"all_episodes"`
 	OpenFlags     []repository.DiscrepancyFlag `json:"open_flags"`
+	Events        []repository.Event           `json:"events"`
 }
 
 type showsHandler struct {
 	shows      *repository.ShowRepository
 	requests   *repository.UserRequestRepository
 	flags      *repository.DiscrepancyFlagRepository
+	events     *repository.EventRepository
 	engine     *state.Engine
 	sonarr     *sonarr.Client
 	plex       *plex.Client
@@ -239,12 +241,20 @@ func (h *showsHandler) detail(w http.ResponseWriter, r *http.Request) {
 		UserBuffers:         computeUserBuffers(reqs, bufferSize, idToName),
 	}
 
+	events := []repository.Event{}
+	if h.events != nil {
+		if evs, err := h.events.FindByShow(tvdbId, 50); err == nil && evs != nil {
+			events = evs
+		}
+	}
+
 	writeJSON(w, ShowDetail{
 		ShowSummary:   summary,
 		Requests:      reqDetails,
 		ExpectedState: expectedState,
 		AllEpisodes:   allEpisodes,
 		OpenFlags:     filteredFlags,
+		Events:        events,
 	})
 }
 

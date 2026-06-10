@@ -1,7 +1,15 @@
 import { useState, useEffect, useCallback, useMemo, useRef, useContext } from 'react';
 import { Loader2, Tv } from 'lucide-react';
 import { api } from '../api/client';
-import type { ShowSummary } from '../api/client';
+import type { ShowSummary, Stats } from '../api/client';
+
+function formatBytes(b: number): string {
+  if (b <= 0) return '0 B';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  const exp = Math.min(Math.floor(Math.log(b) / Math.log(1024)), units.length - 1);
+  const val = b / Math.pow(1024, exp);
+  return `${val >= 100 ? val.toFixed(0) : val.toFixed(1)} ${units[exp]}`;
+}
 import { ShowCard, buildUserColorMap } from '../components/ShowCard';
 import { BackdropContext } from '../context/BackdropContext';
 import { useSSE } from '../hooks/useSSE';
@@ -52,6 +60,7 @@ function Section({ label, color, items, opacity = 1, colorMap, onReconcile, onHo
 
 export function Dashboard() {
   const [shows, setShows] = useState<ShowSummary[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const { setBackdrop } = useContext(BackdropContext);
@@ -64,6 +73,11 @@ export function Dashboard() {
       setError(null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load shows');
+    }
+    try {
+      setStats(await api.getStats());
+    } catch {
+      // Savings stat is decorative — never block the dashboard on it.
     }
     setLoading(false);
   }, []);
@@ -169,11 +183,12 @@ export function Dashboard() {
   return (
     <div ref={dashRef} className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 32 }}>
       {/* Stats */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
         {[
-          { label: 'Active',   count: active.length,   color: 'var(--color-accent-green)' },
-          { label: 'Inactive', count: inactive.length,  color: 'var(--color-accent-amber)' },
-          { label: 'Removed',  count: removed.length,   color: 'var(--color-accent-danger, #ef4444)' },
+          { label: 'Active',   count: String(active.length),   color: 'var(--color-accent-green)' },
+          { label: 'Inactive', count: String(inactive.length),  color: 'var(--color-accent-amber)' },
+          { label: 'Removed',  count: String(removed.length),   color: 'var(--color-accent-danger, #ef4444)' },
+          { label: 'Space saved', count: formatBytes(stats?.bytes_deleted ?? 0), color: 'var(--color-accent-orange)' },
         ].map((stat) => (
           <div key={stat.label} className="stat-card">
             <div className="mono" style={{ fontSize: '2rem', fontWeight: 800, lineHeight: 1, color: stat.color }}>
