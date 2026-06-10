@@ -75,7 +75,7 @@ func main() {
 	}
 
 	// ── State engine ─────────────────────────────────────────────────────────
-	engine := state.NewEngine(shows, requests, plexClient, plexDB)
+	engine := state.NewEngine(shows, requests, plexClient, plexDB, sonarrClient)
 
 	// ── SSE broker ───────────────────────────────────────────────────────────
 	broker := api.NewBroker()
@@ -105,26 +105,28 @@ func main() {
 	// ── Proxy ────────────────────────────────────────────────────────────────
 	interceptor := proxy.NewInterceptor(sonarrClient, shows, engine)
 	interceptor.OnSeriesAdd = func(tvdbId int, requestedSeasons []int) {
+		log.Printf("[proxy] onboard tvdb=%d: waiting for Sonarr to index series, requestedSeasons=%v", tvdbId, requestedSeasons)
+
+		// Retry fetching from Sonarr — the series add is confirmed (2xx) but
+		// Sonarr's internal indexing may not be complete immediately. This runs
+		// in the proxy's goroutine, NOT the serial job queue: sleeping up to
+		// ~55s inside the queue would block every reconcile behind it.
+		var series *sonarr.Series
+		for attempt := 1; attempt <= 10; attempt++ {
+			time.Sleep(time.Duration(attempt) * time.Second)
+			s, err := sonarrClient.GetSeriesByTVDB(tvdbId)
+			if err == nil {
+				series = s
+				break
+			}
+			log.Printf("[proxy] onboard tvdb=%d: attempt %d/10: %v", tvdbId, attempt, err)
+		}
+		if series == nil {
+			log.Printf("[proxy] onboard tvdb=%d: series never appeared in Sonarr, giving up", tvdbId)
+			return
+		}
+
 		queue.Enqueue(func() {
-			log.Printf("[proxy] onboard tvdb=%d: waiting for Sonarr to index series, requestedSeasons=%v", tvdbId, requestedSeasons)
-
-			// Retry fetching from Sonarr — the series add is confirmed (2xx) but
-			// Sonarr's internal indexing may not be complete immediately.
-			var series *sonarr.Series
-			for attempt := 1; attempt <= 10; attempt++ {
-				time.Sleep(time.Duration(attempt) * time.Second)
-				s, err := sonarrClient.GetSeriesByTVDB(tvdbId)
-				if err == nil {
-					series = s
-					break
-				}
-				log.Printf("[proxy] onboard tvdb=%d: attempt %d/10: %v", tvdbId, attempt, err)
-			}
-			if series == nil {
-				log.Printf("[proxy] onboard tvdb=%d: series never appeared in Sonarr, giving up", tvdbId)
-				return
-			}
-
 			if err := shows.Upsert(repository.Show{
 				TVDBId:    tvdbId,
 				SonarrId:  series.ID,

@@ -9,23 +9,82 @@ import (
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
 	"github.com/kiwi3007/rollarr/internal/plex"
+	"github.com/kiwi3007/rollarr/internal/sonarr"
 )
 
 // ExpectedState maps season number → sorted slice of episode numbers that
 // should be downloaded and monitored.
 type ExpectedState map[int][]int
 
-// Interval is an inclusive range of episode numbers within a single season.
-type Interval struct {
-	Start int
-	End   int
+// safetyBehind is how many episodes to retain at-and-below a user's
+// highest-watched mark. Plex records an episode as watched at a playback
+// threshold (~90%), before the user has actually finished it, so deleting at
+// watched+1 can yank the file mid-watch. safetyBehind=1 keeps the watched
+// episode itself.
+const safetyBehind = 1
+
+// epRef identifies one episode as (season, episode).
+type epRef struct {
+	Season  int
+	Episode int
 }
 
-// safetyBehind is how many episodes to retain *below* a user's highest-watched
-// mark. Plex records an episode as watched at a playback threshold (~90%),
-// before the user has actually finished it, so deleting at watched+1 can yank
-// the file mid-watch. Keeping this many behind the mark guards against that.
-const safetyBehind = 1
+// layout is the linear episode structure of a show as known to Sonarr.
+// Episodes are ordered season-major (S01E01, S01E02, …, S02E01, …) so buffer
+// windows can slide across season boundaries. Specials (season 0) are excluded.
+type layout struct {
+	linear []epRef
+	index  map[epRef]int
+}
+
+// buildLayout constructs a layout from Sonarr's episode list.
+func buildLayout(episodes []sonarr.Episode) *layout {
+	bySeason := make(map[int][]int)
+	for _, ep := range episodes {
+		if ep.SeasonNumber <= 0 || ep.EpisodeNumber <= 0 {
+			continue
+		}
+		bySeason[ep.SeasonNumber] = append(bySeason[ep.SeasonNumber], ep.EpisodeNumber)
+	}
+
+	seasons := make([]int, 0, len(bySeason))
+	for s := range bySeason {
+		seasons = append(seasons, s)
+	}
+	sort.Ints(seasons)
+
+	l := &layout{index: make(map[epRef]int)}
+	for _, s := range seasons {
+		eps := bySeason[s]
+		sort.Ints(eps)
+		prev := 0
+		for _, e := range eps {
+			if e == prev {
+				continue // duplicate episode rows (multi-file)
+			}
+			prev = e
+			ref := epRef{Season: s, Episode: e}
+			l.index[ref] = len(l.linear)
+			l.linear = append(l.linear, ref)
+		}
+	}
+	return l
+}
+
+// positionIndex returns the linear index of the latest episode at or before
+// (season, episode), or -1 if (season, episode) precedes the first episode.
+// Handles watched episodes Sonarr doesn't know about by snapping to the
+// nearest earlier known episode.
+func (l *layout) positionIndex(season, episode int) int {
+	if idx, ok := l.index[epRef{Season: season, Episode: episode}]; ok {
+		return idx
+	}
+	i := sort.Search(len(l.linear), func(i int) bool {
+		e := l.linear[i]
+		return e.Season > season || (e.Season == season && e.Episode > episode)
+	})
+	return i - 1
+}
 
 // Engine computes the expected download state for a show based on user watch
 // progress and the configured buffer size.
@@ -34,6 +93,7 @@ type Engine struct {
 	requests *repository.UserRequestRepository
 	plex     *plex.Client
 	plexdb   *plex.PlexDB // may be nil
+	sonarr   *sonarr.Client
 }
 
 // NewEngine constructs an Engine. plexDB may be nil if the Plex SQLite path is
@@ -43,12 +103,14 @@ func NewEngine(
 	requests *repository.UserRequestRepository,
 	plexClient *plex.Client,
 	plexDB *plex.PlexDB,
+	sonarrClient *sonarr.Client,
 ) *Engine {
 	return &Engine{
 		shows:    shows,
 		requests: requests,
 		plex:     plexClient,
 		plexdb:   plexDB,
+		sonarr:   sonarrClient,
 	}
 }
 
@@ -72,19 +134,42 @@ func (e *Engine) ComputeExpectedState(tvdbId int) (ExpectedState, error) {
 // Compute returns both the expected episode set and per-user watch progress.
 //
 // Algorithm:
-//  1. Load all user_requests for the show.
-//  2. Determine effective buffer size.
-//  3. For each user, fetch Plex watch history (filtered by is_rewatching).
-//  4. Build season→highestWatchedEp map per user.
-//  5. Compute interval [watched+1, watched+bufferSize] per season per user.
-//  6. Union intervals per season across all users.
-//  7. Append exceptions: S01E01 always; E01 of every season with any request.
-//  8. Return deduplicated, sorted map.
+//  1. Load all user_requests for the show. No requests → empty expected state
+//     (the reconciler separately refuses to act on shows with no requests).
+//  2. Fetch the show's episode list from Sonarr and flatten it into linear
+//     (season-major) order so windows can cross season boundaries.
+//  3. For each user, fetch Plex watch history (HTTP + plexdb), merge with the
+//     stored high-water mark, and reduce to a single linear position.
+//  4. Window per user = linear[pos-safetyBehind+1 … pos+bufferSize].
+//     A user with no episodes ahead of their position (finished everything
+//     Sonarr knows) contributes no window — it revives when new episodes air.
+//     A user with no history seeds at their requested season's E01.
+//  5. Union windows across users, then add anchors: S01E01 whenever the show
+//     has any watcher, plus E01 of each request's requested season.
 func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 	reqs, err := e.requests.FindByShow(tvdbId)
 	if err != nil {
 		return StateResult{}, fmt.Errorf("state.Compute(%d): load requests: %w", tvdbId, err)
 	}
+	if len(reqs) == 0 {
+		return StateResult{Expected: ExpectedState{}, UserProgress: map[string]map[int]int{}}, nil
+	}
+
+	show, err := e.shows.FindByTVDB(tvdbId)
+	if err != nil {
+		return StateResult{}, fmt.Errorf("state.Compute(%d): load show: %w", tvdbId, err)
+	}
+	if show == nil {
+		return StateResult{}, fmt.Errorf("state.Compute(%d): show not in DB", tvdbId)
+	}
+
+	// Fail safe: if Sonarr is unreachable we cannot know the episode layout, so
+	// return an error rather than an empty state that would orphan everything.
+	episodes, err := e.sonarr.GetEpisodes(show.SonarrId)
+	if err != nil {
+		return StateResult{}, fmt.Errorf("state.Compute(%d): sonarr episodes: %w", tvdbId, err)
+	}
+	lay := buildLayout(episodes)
 
 	bufferSize := e.shows.EffectiveBufferSize(tvdbId)
 
@@ -119,6 +204,7 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 
 		// Merge with stored high-water mark so transient plexdb fluctuations can
 		// never shrink the window below what we've already recorded as watched.
+		// Cleared on rewatch, so it cannot pin a rewatcher at the old position.
 		if req.LastWatchedSeason != nil && req.LastWatchedEpisode != nil &&
 			*req.LastWatchedSeason > 0 && *req.LastWatchedEpisode > 0 {
 			s, ep := *req.LastWatchedSeason, *req.LastWatchedEpisode
@@ -133,85 +219,82 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 		log.Printf("[state] tvdb=%d user=%s highest=%v", tvdbId, req.PlexUserID, highest)
 	}
 
-	// Build intervals per season across all users.
-	// intervalsBySeason: season → []Interval
-	intervalsBySeason := make(map[int][]Interval)
+	if len(lay.linear) == 0 {
+		// Sonarr hasn't indexed any episodes yet (fresh series add).
+		log.Printf("[state] Compute tvdb=%d: sonarr has no episodes yet", tvdbId)
+		return StateResult{Expected: ExpectedState{}, UserProgress: perUserHighest}, nil
+	}
+
+	include := make(map[epRef]struct{})
+	addRange := func(from, to int) {
+		if from < 0 {
+			from = 0
+		}
+		if to >= len(lay.linear) {
+			to = len(lay.linear) - 1
+		}
+		for i := from; i <= to; i++ {
+			include[lay.linear[i]] = struct{}{}
+		}
+	}
 
 	for _, req := range reqs {
 		highest := perUserHighest[req.PlexUserID]
-		for season, ep := range highest {
-			interval := Interval{
-				Start: ep + 1 - safetyBehind,
-				End:   ep + bufferSize,
+
+		if len(highest) > 0 {
+			// Reduce multi-season history to a single linear position: the
+			// highest (season, episode) watched.
+			ps, pe := 0, 0
+			for s, ep := range highest {
+				if s > ps || (s == ps && ep > pe) {
+					ps, pe = s, ep
+				}
 			}
-			if interval.Start < 1 {
-				interval.Start = 1
+			idx := lay.positionIndex(ps, pe)
+			if idx+1 >= len(lay.linear) {
+				// Finished every episode Sonarr knows — no window. The window
+				// revives automatically when new episodes appear in Sonarr.
+				log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — no window", tvdbId, req.PlexUserID, ps, pe)
+				continue
 			}
-			intervalsBySeason[season] = append(intervalsBySeason[season], interval)
+			addRange(idx-safetyBehind+1, idx+bufferSize)
+			continue
 		}
 
-		// No live watch history — either a genuine first-watch or a transient
-		// Plex read failure. Prefer stored DB progress over the destructive seed
-		// path so a momentary plexdb lock doesn't orphan all in-progress episodes.
-		if len(highest) == 0 {
-			if req.LastWatchedSeason != nil && req.LastWatchedEpisode != nil &&
-				*req.LastWatchedSeason > 0 && *req.LastWatchedEpisode > 0 {
-				s, ep := *req.LastWatchedSeason, *req.LastWatchedEpisode
-				interval := Interval{
-					Start: ep + 1 - safetyBehind,
-					End:   ep + bufferSize,
-				}
-				if interval.Start < 1 {
-					interval.Start = 1
-				}
-				intervalsBySeason[s] = append(intervalsBySeason[s], interval)
-				log.Printf("[state] tvdb=%d user=%s: live history empty, using stored progress S%02dE%02d as fallback",
-					tvdbId, req.PlexUserID, s, ep)
-			} else {
-				// Truly no history — seed from the requested season's E01.
-				seedSeason := req.RequestedSeason
-				if seedSeason < 1 {
-					seedSeason = 1
-				}
-				interval := Interval{Start: 1, End: bufferSize}
-				intervalsBySeason[seedSeason] = append(intervalsBySeason[seedSeason], interval)
-			}
+		// No history at all — seed from the requested season's premiere.
+		seedSeason := req.RequestedSeason
+		if seedSeason < 1 {
+			seedSeason = 1
 		}
+		startIdx, ok := lay.index[epRef{Season: seedSeason, Episode: 1}]
+		if !ok {
+			startIdx = 0 // requested season unknown to Sonarr — seed from the start
+		}
+		addRange(startIdx, startIdx+bufferSize-1)
 	}
 
-	// Union intervals per season.
-	result := make(ExpectedState)
-	for season, intervals := range intervalsBySeason {
-		merged := unionIntervals(intervals)
-		var eps []int
-		for _, iv := range merged {
-			for ep := iv.Start; ep <= iv.End; ep++ {
-				if ep > 0 {
-					eps = append(eps, ep)
-				}
-			}
-		}
-		result[season] = eps
+	// Anchors: S01E01 is always available while the show has any watcher, and
+	// each request's requested-season premiere stays available.
+	if _, ok := lay.index[epRef{Season: 1, Episode: 1}]; ok {
+		include[epRef{Season: 1, Episode: 1}] = struct{}{}
 	}
-
-	// E01 of each user's requested season is always included.
 	for _, req := range reqs {
 		s := req.RequestedSeason
 		if s < 1 {
 			s = 1
 		}
-		result[s] = addEpisode(result[s], 1)
+		ref := epRef{Season: s, Episode: 1}
+		if _, ok := lay.index[ref]; ok {
+			include[ref] = struct{}{}
+		}
 	}
 
-	// E01 of every season with watch history is always kept.
-	seasonsWithRequests := collectSeasonsWithRequests(reqs, perUserHighest, bufferSize)
-	for season := range seasonsWithRequests {
-		result[season] = addEpisode(result[season], 1)
+	result := make(ExpectedState)
+	for ref := range include {
+		result[ref.Season] = append(result[ref.Season], ref.Episode)
 	}
-
-	// Deduplicate and sort each season's episode list.
-	for season, eps := range result {
-		result[season] = dedupSorted(eps)
+	for s := range result {
+		sort.Ints(result[s])
 	}
 
 	log.Printf("[state] Compute tvdb=%d result: %v", tvdbId, result)
@@ -328,75 +411,4 @@ func (e *Engine) knownAccountIDs() map[int]bool {
 		ids[id] = true
 	}
 	return ids
-}
-
-// collectSeasonsWithRequests returns the set of season numbers that are
-// relevant to at least one user request.
-func collectSeasonsWithRequests(
-	reqs []repository.UserRequest,
-	perUserHighest map[string]map[int]int,
-	bufferSize int,
-) map[int]struct{} {
-	seasons := make(map[int]struct{})
-	for _, req := range reqs {
-		highest := perUserHighest[req.PlexUserID]
-		for season := range highest {
-			seasons[season] = struct{}{}
-		}
-		// Always include season 1 for any active request.
-		seasons[1] = struct{}{}
-		_ = bufferSize
-	}
-	return seasons
-}
-
-// unionIntervals merges a slice of intervals into the minimal covering set.
-// Intervals are sorted by Start, then overlapping/adjacent intervals are merged.
-func unionIntervals(intervals []Interval) []Interval {
-	if len(intervals) == 0 {
-		return nil
-	}
-
-	sort.Slice(intervals, func(i, j int) bool {
-		return intervals[i].Start < intervals[j].Start
-	})
-
-	merged := []Interval{intervals[0]}
-	for _, iv := range intervals[1:] {
-		last := &merged[len(merged)-1]
-		if iv.Start <= last.End+1 {
-			// Overlapping or adjacent — extend.
-			if iv.End > last.End {
-				last.End = iv.End
-			}
-		} else {
-			merged = append(merged, iv)
-		}
-	}
-	return merged
-}
-
-// addEpisode appends ep to eps if it is not already present.
-func addEpisode(eps []int, ep int) []int {
-	for _, e := range eps {
-		if e == ep {
-			return eps
-		}
-	}
-	return append(eps, ep)
-}
-
-// dedupSorted returns a sorted, deduplicated copy of eps.
-func dedupSorted(eps []int) []int {
-	if len(eps) == 0 {
-		return nil
-	}
-	sort.Ints(eps)
-	out := eps[:1]
-	for i := 1; i < len(eps); i++ {
-		if eps[i] != eps[i-1] {
-			out = append(out, eps[i])
-		}
-	}
-	return out
 }

@@ -5,6 +5,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
@@ -12,6 +13,19 @@ import (
 	"github.com/kiwi3007/rollarr/internal/sonarr"
 	"github.com/kiwi3007/rollarr/internal/state"
 )
+
+// Search backoff: an episode that stays missing after a search is retried with
+// exponentially increasing delay so unfindable episodes don't hammer indexers
+// every reconcile cycle. State is in-memory; a restart resets it, which is fine.
+const (
+	searchBackoffBase = 30 * time.Minute
+	searchBackoffMax  = 12 * time.Hour
+)
+
+type searchAttempt struct {
+	attempts int
+	nextAt   time.Time
+}
 
 // Reconciler computes expected vs actual episode state and drives Sonarr ops
 // to converge them.
@@ -23,6 +37,9 @@ type Reconciler struct {
 	plex     *plex.Client
 	plexdb   *plex.PlexDB // may be nil
 	engine   *state.Engine
+
+	mu            sync.Mutex
+	searchBackoff map[int]searchAttempt // sonarr episode ID → backoff state
 }
 
 // NewReconciler constructs a Reconciler.
@@ -36,14 +53,46 @@ func NewReconciler(
 	engine *state.Engine,
 ) *Reconciler {
 	return &Reconciler{
-		shows:    shows,
-		requests: requests,
-		flags:    flags,
-		sonarr:   sonarrClient,
-		plex:     plexClient,
-		plexdb:   plexDB,
-		engine:   engine,
+		shows:         shows,
+		requests:      requests,
+		flags:         flags,
+		sonarr:        sonarrClient,
+		plex:          plexClient,
+		plexdb:        plexDB,
+		engine:        engine,
+		searchBackoff: make(map[int]searchAttempt),
 	}
+}
+
+// searchAllowed reports whether the episode is past its backoff delay.
+func (r *Reconciler) searchAllowed(episodeId int, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	a, ok := r.searchBackoff[episodeId]
+	return !ok || now.After(a.nextAt)
+}
+
+// recordSearch advances the backoff state for episodes that were just searched.
+func (r *Reconciler) recordSearch(episodeIds []int, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range episodeIds {
+		a := r.searchBackoff[id]
+		a.attempts++
+		delay := searchBackoffBase << (a.attempts - 1)
+		if delay > searchBackoffMax || delay <= 0 {
+			delay = searchBackoffMax
+		}
+		a.nextAt = now.Add(delay)
+		r.searchBackoff[id] = a
+	}
+}
+
+// clearSearchBackoff resets backoff for an episode that now has a file.
+func (r *Reconciler) clearSearchBackoff(episodeId int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.searchBackoff, episodeId)
 }
 
 // ReconcileShow computes expected vs actual state for the given show and issues
@@ -63,6 +112,18 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	// 1a. Auto-discover watchers who started playing without a Seerr request.
 	if showKey, err := r.plex.FindShowByTVDB(tvdbId); err == nil {
 		r.discoverNewWatchers(show, showKey)
+	}
+
+	// 1b. Safety guard: a show with no user requests must never be reconciled —
+	// an empty expected state would orphan-delete every file. This state means
+	// the request row was lost (API delete, failed webhook); flag it instead.
+	reqs, err := r.requests.FindByShow(tvdbId)
+	if err != nil {
+		return fmt.Errorf("reconcile(%d): load requests: %w", tvdbId, err)
+	}
+	if len(reqs) == 0 {
+		log.Printf("[reconcile] tvdb=%d has no user requests — skipping all Sonarr ops", tvdbId)
+		return nil
 	}
 
 	// 1. Compute expected state and per-user progress.
@@ -130,15 +191,20 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		queuedIDs = map[int]bool{}
 	}
 
+	now := time.Now()
 	var missingIds []int
 	for k := range expectedSet {
-		if _, hasFile := actualWithFile[k]; !hasFile {
-			// Search regardless of monitored state: a previous cycle may have
-			// monitored the episode (step 7) without Sonarr successfully
-			// downloading it, leaving it stuck as monitored+no-file forever.
-			if info, ok := episodesByKey[k]; ok && !queuedIDs[info.id] {
-				missingIds = append(missingIds, info.id)
-			}
+		if info, hasFile := actualWithFile[k]; hasFile {
+			r.clearSearchBackoff(info.id)
+			continue
+		}
+		// Search regardless of monitored state: a previous cycle may have
+		// monitored the episode (step 7) without Sonarr successfully
+		// downloading it, leaving it stuck as monitored+no-file forever.
+		// Episodes already searched recently are skipped via exponential
+		// backoff so unfindable releases don't hammer indexers every cycle.
+		if info, ok := episodesByKey[k]; ok && !queuedIDs[info.id] && r.searchAllowed(info.id, now) {
+			missingIds = append(missingIds, info.id)
 		}
 	}
 
@@ -195,10 +261,15 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	}
 
 	if len(missingIds) > 0 {
+		r.recordSearch(missingIds, now)
 		if err := r.sonarr.SearchEpisodes(missingIds); err != nil {
 			log.Printf("[reconcile] tvdb=%d search episodes: %v", tvdbId, err)
-			// Insert a discrepancy flag for each missing episode that couldn't be searched.
+			// Insert a discrepancy flag for each missing episode that couldn't be
+			// searched — at most one open flag per episode.
 			for _, epId := range missingIds {
+				if exists, ferr := r.flags.HasOpenForEpisode(tvdbId, epId); ferr != nil || exists {
+					continue
+				}
 				flag := repository.DiscrepancyFlag{
 					TVDBId:           tvdbId,
 					SonarrEpisodeId:  &epId,
@@ -259,27 +330,37 @@ func (r *Reconciler) PruneInactive() error {
 
 	now := time.Now()
 	for _, show := range shows {
-		if show.LastActivityAt == nil {
+		// Effective last activity = max(last watch event, newest request).
+		// Including request timestamps protects a freshly (re-)added show whose
+		// only watch history predates the request — without it, a re-add of a
+		// show with years-old history would be pruned within the hour.
+		last := show.LastActivityAt
+		if reqs, err := r.requests.FindByShow(show.TVDBId); err == nil {
+			for _, req := range reqs {
+				if last == nil || req.RequestTimestamp.After(*last) {
+					t := req.RequestTimestamp
+					last = &t
+				}
+			}
+		}
+		if last == nil {
 			continue
 		}
+
 		days := r.shows.EffectiveInactivityDays(show.TVDBId)
 		threshold := time.Duration(days) * 24 * time.Hour
-		if now.Sub(*show.LastActivityAt) < threshold {
+		if now.Sub(*last) < threshold {
 			continue
 		}
 
-		log.Printf("[reconcile] marking show %d (%s) as inactive", show.TVDBId, show.Title)
+		log.Printf("[reconcile] show %d (%s) inactive — cleaning up", show.TVDBId, show.Title)
 
-		// Mark inactive.
-		if err := r.shows.UpdateStatus(show.TVDBId, "inactive"); err != nil {
-			log.Printf("[reconcile] update status %d: %v", show.TVDBId, err)
-			continue
-		}
-
-		// Delete all episode files and unmonitor.
+		// Clean up in Sonarr FIRST, mark inactive last: PruneInactive only
+		// iterates active shows, so flipping the status before a failed cleanup
+		// would strand the files forever.
 		episodes, err := r.sonarr.GetEpisodes(show.SonarrId)
 		if err != nil {
-			log.Printf("[reconcile] get episodes for inactive show %d: %v", show.TVDBId, err)
+			log.Printf("[reconcile] get episodes for inactive show %d: %v (will retry next run)", show.TVDBId, err)
 			continue
 		}
 
@@ -297,6 +378,10 @@ func (r *Reconciler) PruneInactive() error {
 			if err := r.sonarr.MonitorEpisodes(allIds, false); err != nil {
 				log.Printf("[reconcile] unmonitor all for show %d: %v", show.TVDBId, err)
 			}
+		}
+
+		if err := r.shows.UpdateStatus(show.TVDBId, "inactive"); err != nil {
+			log.Printf("[reconcile] update status %d: %v", show.TVDBId, err)
 		}
 	}
 	return nil
@@ -353,11 +438,15 @@ func (r *Reconciler) discoverNewWatchers(show *repository.Show, showKey string) 
 		if knownIDs[accountID] {
 			continue
 		}
+		// RequestedSeason 0 marks an auto-discovered watcher: the state engine
+		// skips the request-timestamp history filter for these rows so their
+		// pre-existing watch progress is honoured.
 		req := repository.UserRequest{
 			PlexUserID:       strconv.Itoa(accountID),
 			TVDBId:           show.TVDBId,
 			RequestTimestamp: time.Now(),
 			IsRewatching:     false,
+			RequestedSeason:  0,
 		}
 		if err := r.requests.Upsert(req); err != nil {
 			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: upsert accountId=%d: %v", show.TVDBId, accountID, err)
@@ -375,28 +464,40 @@ func (r *Reconciler) discoverNewWatchers(show *repository.Show, showKey string) 
 	}
 }
 
-// updateLastActivity fetches the most recent Plex watch event for the show and
-// updates last_activity_at in the DB.
+// updateLastActivity fetches the most recent Plex watch event for the show —
+// from both the HTTP history API and the Plex SQLite DB (managed home accounts
+// and "Mark as Watched" often appear only in the latter) — and advances
+// last_activity_at in the DB. The value is monotonic: it never moves backwards.
 func (r *Reconciler) updateLastActivity(show *repository.Show) {
 	showKey, err := r.plex.FindShowByTVDB(show.TVDBId)
 	if err != nil {
 		return // show not in Plex yet
 	}
 
-	entries, err := r.plex.GetShowHistory(showKey)
-	if err != nil || len(entries) == 0 {
-		return
+	var latest time.Time
+
+	if entries, err := r.plex.GetShowHistory(showKey); err == nil {
+		for _, e := range entries {
+			if e.ViewedAt.After(latest) {
+				latest = e.ViewedAt
+			}
+		}
 	}
 
-	// Find the most recent entry.
-	var latest time.Time
-	for _, e := range entries {
-		if e.ViewedAt.After(latest) {
-			latest = e.ViewedAt
+	if r.plexdb != nil {
+		if marked, err := r.plexdb.GetMarkedWatched(showKey, 0); err == nil {
+			for _, m := range marked {
+				if m.ViewedAt.After(latest) {
+					latest = m.ViewedAt
+				}
+			}
 		}
 	}
 
 	if latest.IsZero() {
+		return
+	}
+	if show.LastActivityAt != nil && !latest.After(*show.LastActivityAt) {
 		return
 	}
 

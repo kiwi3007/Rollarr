@@ -168,12 +168,18 @@ type directory struct {
 	Title     string `xml:"title,attr"`
 }
 
+// historyContainerSize is sent explicitly on history requests so PMS never
+// silently pages the result — a truncated history would under-report a user's
+// highest-watched episode.
+const historyContainerSize = 10000
+
 // GetShowHistory returns all watch history entries for the show identified by
 // the given Plex ratingKey (e.g. "12345").
 func (c *Client) GetShowHistory(showKey string) ([]WatchHistoryEntry, error) {
 	// Strip leading slash if present in the key.
 	key := strings.TrimPrefix(showKey, "/library/metadata/")
-	path := fmt.Sprintf("/status/sessions/history/all?type=4&metadataItemID=%s", url.QueryEscape(key))
+	path := fmt.Sprintf("/status/sessions/history/all?type=4&metadataItemID=%s&X-Plex-Container-Start=0&X-Plex-Container-Size=%d",
+		url.QueryEscape(key), historyContainerSize)
 
 	var mc mediaContainer
 	if err := c.getXML(path, &mc); err != nil {
@@ -188,8 +194,8 @@ func (c *Client) GetShowHistory(showKey string) ([]WatchHistoryEntry, error) {
 func (c *Client) GetAccountHistory(showKey string, accountId int) ([]WatchHistoryEntry, error) {
 	key := strings.TrimPrefix(showKey, "/library/metadata/")
 	path := fmt.Sprintf(
-		"/status/sessions/history/all?type=4&accountID=%d&metadataItemID=%s",
-		accountId, url.QueryEscape(key),
+		"/status/sessions/history/all?type=4&accountID=%d&metadataItemID=%s&X-Plex-Container-Start=0&X-Plex-Container-Size=%d",
+		accountId, url.QueryEscape(key), historyContainerSize,
 	)
 
 	var mc mediaContainer

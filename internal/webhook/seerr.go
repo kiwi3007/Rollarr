@@ -183,18 +183,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check if user is rewatching.
 	isRewatching := h.isRewatching(tvdbId, plexUserId, requestedSeason)
 
-	// Upsert user request.
+	// Upsert user request. requested_season is written here so re-requests of a
+	// series that already exists in Sonarr (where the proxy's series-add hook
+	// never fires) still reseed the window at the right season.
 	req := repository.UserRequest{
 		PlexUserID:       plexUserId,
 		DisplayName:      displayName,
 		TVDBId:           tvdbId,
 		RequestTimestamp: time.Now(),
 		IsRewatching:     isRewatching,
+		RequestedSeason:  requestedSeason,
 	}
 	if err := h.requests.Upsert(req); err != nil {
 		log.Printf("[webhook] upsert request tvdb=%d user=%s: %v", tvdbId, plexUserId, err)
 		http.Error(w, fmt.Sprintf("upsert request: %v", err), http.StatusInternalServerError)
 		return
+	}
+
+	// A rewatch must drop the stored high-water mark, otherwise the state
+	// engine's progress floor pins the window at the old position forever.
+	if isRewatching {
+		if err := h.requests.ClearWatchProgress(tvdbId, plexUserId); err != nil {
+			log.Printf("[webhook] clear progress for rewatch tvdb=%d user=%s: %v", tvdbId, plexUserId, err)
+		}
 	}
 
 	// Enqueue reconciliation (non-blocking).

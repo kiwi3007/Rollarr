@@ -40,6 +40,21 @@ func (r *DiscrepancyFlagRepository) Insert(f DiscrepancyFlag) error {
 	return nil
 }
 
+// HasOpenForEpisode reports whether an open flag already exists for the given
+// (tvdb_id, sonarr_episode_id) pair, so reconcile cycles don't insert duplicates.
+func (r *DiscrepancyFlagRepository) HasOpenForEpisode(tvdbId, episodeId int) (bool, error) {
+	var count int
+	err := r.db.QueryRow(
+		`SELECT COUNT(*) FROM discrepancy_flags
+		 WHERE tvdb_id = ? AND sonarr_episode_id = ? AND status = 'open'`,
+		tvdbId, episodeId,
+	).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("discrepancy_flags.HasOpenForEpisode(%d, %d): %w", tvdbId, episodeId, err)
+	}
+	return count > 0, nil
+}
+
 func scanFlag(scan func(...interface{}) error) (*DiscrepancyFlag, error) {
 	var f DiscrepancyFlag
 	var epID sql.NullInt64

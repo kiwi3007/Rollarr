@@ -4,108 +4,72 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project does
 
-Rollarr is a JIT episode buffer manager for Plex + Sonarr. It tracks what each user has watched via Plex history, then tells Sonarr to keep only a sliding window of `buffer_size` episodes downloaded ahead of their progress — deleting behind and downloading ahead as they watch. Seerr (Overseerr/Jellyseerr) webhooks trigger new show onboarding.
+Rollarr is a JIT episode buffer manager for Plex + Sonarr. It tracks what each user has watched via Plex history, then tells Sonarr to keep only a sliding window of `buffer_size` episodes downloaded ahead of their progress — deleting behind and downloading ahead as they watch. Windows cross season boundaries (episodes are modelled as one linear sequence). Seerr (Overseerr/Jellyseerr) webhooks trigger new show onboarding, and Rollarr sits as a reverse proxy between Seerr and Sonarr to strip full-season searches down to the window.
 
 ## Commands
 
 ```bash
-# Dev (both backend + frontend with hot reload)
+# Full production build (frontend + linux/amd64 binary)
+./build.sh
+
+# Go backend only
+go build ./cmd/rollarr/
+go test ./...
+go vet ./...
+
+# Frontend dev server (Vite)
 npm run dev
 
-# Backend only
-npm run dev -w backend
-
-# Frontend only (Vite, proxies /api and /webhooks to :3001)
-npm run dev -w frontend
-
-# Production build
+# Frontend production build (shared types first, then frontend)
 npm run build
-
-# Type-check without building
-cd backend && npx tsc --noEmit
-cd frontend && npx tsc --noEmit
 ```
 
-**No test suite exists yet.**
+Deploy: push to GitHub → CI builds `ghcr.io/kiwi3007/rollarr` → pulled by the Arr-stack compose (separate `docker_compose` repo). Live logs: `GET http://<host>:3001/api/logs?tail=200`.
 
-### Backend .env setup
-
-Copy `.env.example` to `backend/.env`. `ROLLARR_API_TOKEN` gates all `/api/*` endpoints — omit in dev, required in prod. The Sonarr/Plex/Seerr env vars seed the settings table on first boot only; the UI is source of truth thereafter.
-
-### Docker
-
-```bash
-docker compose up -d
-```
-
-Plex DB mount (optional, enables "Mark as Watched" detection) is commented out in `docker-compose.yml`.
+`_legacy/` holds the retired TypeScript backend — reference only, never edit.
 
 ## Architecture
 
-### Monorepo structure
-
-- `shared/` — TypeScript types shared between backend and frontend (`ShowRow`, `TrackerRow`, `EpisodeStatus`, Sonarr/Plex API shapes, etc.)
-- `backend/` — Express API + SQLite + cron jobs
-- `frontend/` — React + Vite + Tailwind SPA
-
-### Backend layers
+Go backend (`cmd/rollarr`, `internal/`), React+Vite frontend (`frontend/`, embedded into the binary via `assets.go`), shared TS types (`shared/`) for the frontend only.
 
 ```
-index.ts           — Express setup, runs migrations, starts scheduler
-config.ts          — Single config object from env vars
-db/
-  database.ts      — better-sqlite3 singleton (WAL mode, FK enforcement)
-  migrations.ts    — sequential numbered migrations, schema_version in settings table
-  repositories/    — one file per table, synchronous SQLite prepared statements
-services/
-  sonarrService.ts — Sonarr v3 REST client
-  plexService.ts   — Plex HTTP API + optional SQLite DB reads (for "Mark as Watched")
-  rollingWindowService.ts — core business logic (see below)
-jobs/
-  scheduler.ts     — node-cron, snaps poll intervals to valid cron strides
-  discoveryJob.ts  — syncs Sonarr shows/episodes into DB
-  progressJob.ts   — calls advanceWindow for every active show
-  maintenanceJob.ts — marks shows Stale/Removed, handles inactivity
-webhooks/
-  seerrWebhook.ts  — POST /webhooks/seerr and /webhooks/jellyseerr
-api/
-  router.ts        — Bearer auth middleware, mounts sub-routers
-  showsRouter.ts / settingsRouter.ts / usersRouter.ts / trackersRouter.ts
-utils/
-  asyncQueue.ts    — serial job queue (prevents concurrent advanceWindow races)
-  logger.ts        — structured logger with module labels
-  retry.ts         — exponential backoff helper
+cmd/rollarr/main.go    — wiring: DB, repos, clients, engine, reconciler, scheduler, proxy, router
+internal/
+  config/              — env var config (seeds settings table on first boot only)
+  db/                  — sql.DB open + sequential migrations (schema_version in settings table)
+  db/repository/       — shows, user_requests, discrepancy_flags, settings
+  plex/                — Plex HTTP API client + optional read-only Plex SQLite DB (plexdb.go,
+                         "Mark as Watched" detection; cloud↔local account ID translation)
+  sonarr/              — Sonarr v3 REST client
+  state/               — Engine: computes ExpectedState (season → episodes that should exist)
+  reconcile/           — Reconciler: expected vs actual, drives Sonarr delete/monitor/search
+  scheduler/           — cron + serial JobQueue (ALL jobs run through it; prevents races)
+  proxy/               — reverse proxy to Sonarr; intercepts series-add, episode/monitor,
+                         command (search) to scope Seerr's requests to the window
+  webhook/             — POST /webhooks/seerr and /webhooks/jellyseerr
+  api/                 — admin REST API (Bearer auth) + SSE + embedded SPA
 ```
 
-### Core business logic: `rollingWindowService.advanceWindow`
+### Core flow
 
-Four phases run per-show on each poll:
+1. **Seerr request** → webhook upserts show + user_request (`requested_season`, rewatch detection) → Seerr POSTs the series to Sonarr *through the proxy*, which disables search-on-add and fires `OnSeriesAdd` (retries until Sonarr indexes, then reconciles).
+2. **state.Engine.Compute(tvdbId)** — builds a *linear* episode layout from Sonarr, fetches per-user Plex history (HTTP + plexdb, merged with the stored `last_watched_*` floor), reduces each user to one linear position, window = `[pos-safetyBehind+1, pos+bufferSize]` in linear order. No history → seed at requested season E01. No episodes ahead (finished) → no window (revives when new episodes appear). Anchors: S01E01 while any watcher exists + each request's requested-season E01.
+3. **reconcile.Reconciler.ReconcileShow** — expected vs actual: deletes orphaned files, *then* unmonitors out-of-window (Sonarr re-monitors on file delete, so order matters), monitors expected, searches missing (skipping queued + exponential search backoff). Refuses to act when a show has zero user_requests (empty expected would wipe everything).
+4. **PruneInactive** — inactivity = max(last watch event incl. plexdb, newest request_timestamp) older than threshold → delete all files + unmonitor, mark inactive *last* (so failures retry).
 
-1. **Plex history fetch** — merges show-scoped history, global history (key/title match), and optional SQLite DB reads into `historyBySeason: Map<accountId, Map<season, highestEp>>`
-2. **Tracker progress update** — resolves synthetic `seerr:username` account IDs, updates each tracker's `last_watched_season/episode`
-3. **Sonarr ops** — deletes files behind the window, monitors + searches episodes ahead; guarded by a DB pre-check to skip Sonarr calls when nothing changed
-4. **DB commit** — single `better-sqlite3` transaction updates episode statuses and `current_window_start`
+### Key invariants
 
-All jobs run through `asyncQueue` to serialise against webhook-triggered runs.
+- `requested_season = 0` marks an **auto-discovered watcher** (found via Plex history, no Seerr request); the engine skips the request-timestamp history filter for them. `>= 1` is Seerr-initiated and history before `request_timestamp` is ignored.
+- Stored watch progress (`last_watched_season/episode`) is a forward-only floor; it is cleared when a rewatch starts (webhook or PATCH request API).
+- Unknown state must fail safe: Sonarr/Plex errors abort the reconcile before any delete; they never produce an empty expected state.
+- Everything that touches Sonarr/Plex runs through the serial `JobQueue`.
 
-### Auth flow
+### Auth
 
-- `/api/*` — Bearer token (`ROLLARR_API_TOKEN`), checked in `api/router.ts` with `timingSafeEqual`
-- `/webhooks/*` — separate router, uses `X-Webhook-Secret` header with `timingSafeEqual`
-- Frontend receives the token injected into `index.html` at boot via `window.__ROLLARR_TOKEN__`
+- `/api/*` — Bearer token, timing-safe compare; token injected into the SPA via `window.__ROLLARR_TOKEN__`.
+- `/webhooks/*` — `X-Webhook-Secret` header.
+- `/api/v3/*` and `/sonarr-proxy/*` — forwarded to Sonarr (Sonarr's own API key auth applies).
 
 ### Settings
 
-Stored in the `settings` SQLite table. Env vars seed empty values on first boot only (`seedFromEnv` in migrations.ts). `settingsRepository` provides typed helpers including `getNumber`. Scheduler reads poll/maintenance intervals at startup — changing them requires a restart.
-
-### DB migrations
-
-`migrations.ts` maintains an array of sequential migration functions. Version tracked as `schema_version` in the settings table. New migrations: append to the array. Migration 0 seeds default settings.
-
-## Known deferred issues
-
-See `LATER_FIXES.md` for a post-review list. Highlights:
-- `trackersRouter.ts` is dead code (never imported)
-- `isDryMode()` is duplicated in `rollingWindowService.ts` and `discoveryJob.ts`
-- `frontend/src/api/client.ts` redefines shared types instead of importing from `@rollarr/shared`
-- Migration `ALTER TABLE` statements are not idempotent on their own (version row is the only guard)
+`settings` SQLite table; env vars seed empty values on first boot only, the UI is source of truth thereafter. Scheduler intervals are read at startup — changing them requires a restart.

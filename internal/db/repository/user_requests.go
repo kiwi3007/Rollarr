@@ -30,23 +30,40 @@ func NewUserRequestRepository(db *sql.DB) *UserRequestRepository {
 }
 
 // Upsert inserts a new user_request row or replaces the existing one for the
-// same (plex_user_id, tvdb_id) pair.
+// same (plex_user_id, tvdb_id) pair. requested_season is written explicitly:
+// 0 marks an auto-discovered watcher (no history-timestamp filtering), >=1 a
+// Seerr-initiated request.
 func (r *UserRequestRepository) Upsert(req UserRequest) error {
 	rewatching := 0
 	if req.IsRewatching {
 		rewatching = 1
 	}
 	_, err := r.db.Exec(
-		`INSERT INTO user_requests (plex_user_id, display_name, tvdb_id, request_timestamp, is_rewatching)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO user_requests (plex_user_id, display_name, tvdb_id, request_timestamp, is_rewatching, requested_season)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(plex_user_id, tvdb_id) DO UPDATE SET
 		 	display_name      = COALESCE(excluded.display_name, display_name),
 		 	request_timestamp = excluded.request_timestamp,
-		 	is_rewatching     = excluded.is_rewatching`,
-		req.PlexUserID, nullString(req.DisplayName), req.TVDBId, req.RequestTimestamp, rewatching,
+		 	is_rewatching     = excluded.is_rewatching,
+		 	requested_season  = excluded.requested_season`,
+		req.PlexUserID, nullString(req.DisplayName), req.TVDBId, req.RequestTimestamp, rewatching, req.RequestedSeason,
 	)
 	if err != nil {
 		return fmt.Errorf("user_requests.Upsert(%q, %d): %w", req.PlexUserID, req.TVDBId, err)
+	}
+	return nil
+}
+
+// ClearWatchProgress nulls the stored high-water mark for a user. Called when a
+// rewatch begins so the stored floor doesn't pin the window at the old position.
+func (r *UserRequestRepository) ClearWatchProgress(tvdbId int, plexUserId string) error {
+	_, err := r.db.Exec(
+		`UPDATE user_requests SET last_watched_season = NULL, last_watched_episode = NULL
+		 WHERE tvdb_id = ? AND plex_user_id = ?`,
+		tvdbId, plexUserId,
+	)
+	if err != nil {
+		return fmt.Errorf("user_requests.ClearWatchProgress(%d, %q): %w", tvdbId, plexUserId, err)
 	}
 	return nil
 }
@@ -137,7 +154,9 @@ func (r *UserRequestRepository) Delete(tvdbId int, plexUserId string) error {
 
 // SetRewatching updates is_rewatching and request_timestamp for the given
 // (tvdb_id, plex_user_id) pair. since sets the timestamp baseline used to
-// filter history when is_rewatching=true.
+// filter history when is_rewatching=true. Enabling a rewatch also clears the
+// stored watch progress so the window reseeds instead of staying pinned at the
+// old high-water mark.
 func (r *UserRequestRepository) SetRewatching(tvdbId int, plexUserId string, v bool, since time.Time) error {
 	rewatching := 0
 	if v {
@@ -149,6 +168,9 @@ func (r *UserRequestRepository) SetRewatching(tvdbId int, plexUserId string, v b
 	)
 	if err != nil {
 		return fmt.Errorf("user_requests.SetRewatching(%d, %q): %w", tvdbId, plexUserId, err)
+	}
+	if v {
+		return r.ClearWatchProgress(tvdbId, plexUserId)
 	}
 	return nil
 }

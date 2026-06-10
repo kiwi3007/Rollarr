@@ -407,14 +407,11 @@ func (i *Interceptor) resolveEpisodes(episodeIds []int) (map[int]sonarr.Episode,
 		return result, nil
 	}
 
-	// Group newly fetched episodes by series and populate cache.
-	bySeries := make(map[int][]sonarr.Episode)
+	// getEpisodesByIDs already populated the cache with each series' FULL
+	// episode list via getEpisodes — do not re-set it here with only the
+	// matched subset, or windowEpisodeIds would see partial lists for 5 min.
 	for _, ep := range episodes {
-		bySeries[ep.SeriesId] = append(bySeries[ep.SeriesId], ep)
 		result[ep.ID] = ep
-	}
-	for seriesId, eps := range bySeries {
-		i.cache.set(seriesId, eps)
 	}
 
 	return result, nil
