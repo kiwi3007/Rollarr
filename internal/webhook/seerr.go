@@ -104,10 +104,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify webhook secret (timing-safe).
+	// Verify webhook secret (timing-safe). Never log the secret values —
+	// /api/logs may be reachable without auth.
 	secret := h.settings.Get("seerr_webhook_secret")
 	incoming := r.Header.Get("X-Webhook-Secret")
-	log.Printf("[webhook] secret check: configured=%q incoming=%q", secret, incoming)
 	if secret != "" {
 		if subtle.ConstantTimeCompare([]byte(incoming), []byte(secret)) != 1 {
 			log.Printf("[webhook] rejected: secret mismatch")
