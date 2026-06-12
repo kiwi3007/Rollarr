@@ -140,7 +140,14 @@ func (h *libraryHandler) preview(w http.ResponseWriter, r *http.Request) {
 	// Falls back to the global default when the show isn't tracked yet.
 	bufferSize := h.shows.EffectiveBufferSize(tvdbId)
 
-	result, err := h.engine.Preview(tvdbId, series.ID, bufferSize, manual)
+	// The library list already holds each show's Plex ratingKey; passing it back
+	// as ?key= lets per-card previews skip FindShowByTVDB's full library scan.
+	var result state.PreviewResult
+	if key := r.URL.Query().Get("key"); key != "" {
+		result, err = h.engine.PreviewWithKey(tvdbId, series.ID, key, bufferSize, manual)
+	} else {
+		result, err = h.engine.Preview(tvdbId, series.ID, bufferSize, manual)
+	}
 	if err != nil {
 		http.Error(w, "preview failed: "+err.Error(), http.StatusBadGateway)
 		return

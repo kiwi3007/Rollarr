@@ -50,17 +50,24 @@ type PreviewResult struct {
 // 0 semantics); manual, if non-nil, replaces/adds one watcher seeded at the
 // chosen season with rewatch detection.
 func (e *Engine) Preview(tvdbId, sonarrId, bufferSize int, manual *ManualWatcher) (PreviewResult, error) {
+	showKey, err := e.plex.FindShowByTVDB(tvdbId)
+	if err != nil {
+		showKey = "" // not in Plex — seed-only preview
+	}
+	return e.PreviewWithKey(tvdbId, sonarrId, showKey, bufferSize, manual)
+}
+
+// PreviewWithKey is Preview with an already-resolved Plex ratingKey. Callers
+// computing previews for many shows pass the key they already hold so each
+// preview skips FindShowByTVDB's full library scan. showKey "" means the show
+// isn't in Plex (seed-only preview).
+func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize int, manual *ManualWatcher) (PreviewResult, error) {
 	// Fail safe: a Sonarr error must abort the preview, never show an empty state.
 	episodes, err := e.sonarr.GetEpisodes(sonarrId)
 	if err != nil {
 		return PreviewResult{}, fmt.Errorf("state.Preview(%d): sonarr episodes: %w", tvdbId, err)
 	}
 	lay := buildLayout(episodes)
-
-	showKey, err := e.plex.FindShowByTVDB(tvdbId)
-	if err != nil {
-		showKey = "" // not in Plex — seed-only preview
-	}
 
 	reqs := e.previewRequests(tvdbId, showKey, manual)
 

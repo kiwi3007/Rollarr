@@ -141,11 +141,19 @@ export const api = {
     apiFetch<Flag>(`/api/flags/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),
   getStats: () => apiFetch<Stats>('/api/stats'),
   getLibrary: () => apiFetch<PlexLibraryShow[]>('/api/plex/library'),
-  getShowPreview: (tvdbId: number, override?: { user: string; name: string; season: number }) => {
-    const params = override
-      ? `?user=${encodeURIComponent(override.user)}&name=${encodeURIComponent(override.name)}&season=${override.season}`
-      : '';
-    return apiFetch<ShowPreview>(`/api/plex/library/${tvdbId}/preview${params}`);
+  getShowPreview: (
+    tvdbId: number,
+    opts?: { key?: string; override?: { user: string; name: string; season: number } },
+  ) => {
+    const p = new URLSearchParams();
+    if (opts?.key) p.set('key', opts.key);
+    if (opts?.override) {
+      p.set('user', opts.override.user);
+      p.set('name', opts.override.name);
+      p.set('season', String(opts.override.season));
+    }
+    const qs = p.toString();
+    return apiFetch<ShowPreview>(`/api/plex/library/${tvdbId}/preview${qs ? `?${qs}` : ''}`);
   },
   getPlexUsers: () => apiFetch<PlexUserOption[]>('/api/plex/users'),
   addShow: (tvdbId: number, manualUser?: ManualUser) =>
