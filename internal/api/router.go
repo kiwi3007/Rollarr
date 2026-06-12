@@ -53,6 +53,12 @@ func NewRouter(
 			})
 		})
 
+		libH := &libraryHandler{shows: shows, requests: requests, events: events, engine: engine, sonarr: sonarrClient, plex: plexClient, reconciler: reconciler, queue: queue}
+		r.Get("/api/plex/library", libH.list)
+		r.Get("/api/plex/library/{tvdbId}/preview", libH.preview)
+		r.Get("/api/plex/users", libH.users)
+		r.Post("/api/shows", libH.addShow)
+
 		reqsH := &requestsHandler{requests: requests}
 		r.Patch("/api/shows/{tvdbId}/requests/{plexUserId}", reqsH.patchRequest)
 		r.Delete("/api/shows/{tvdbId}/requests/{plexUserId}", reqsH.deleteRequest)

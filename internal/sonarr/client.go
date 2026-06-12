@@ -241,6 +241,17 @@ func (c *Client) GetEpisodeFile(fileId int) (*EpisodeFile, error) {
 	return &result, nil
 }
 
+// GetEpisodeFiles returns all episode file resources for a series in one call.
+// Note: join sizes to episodes via Episode.EpisodeFileId — the bulk resource
+// does not reliably populate episodeNumber.
+func (c *Client) GetEpisodeFiles(seriesId int) ([]EpisodeFile, error) {
+	var result []EpisodeFile
+	if err := c.get(fmt.Sprintf("/api/v3/episodefile?seriesId=%d", seriesId), &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 // DeleteEpisodeFile deletes the episode file with the given ID from Sonarr.
 func (c *Client) DeleteEpisodeFile(fileId int) error {
 	path := fmt.Sprintf("/api/v3/episodefile/%d", fileId)
