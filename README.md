@@ -6,6 +6,7 @@
 Rollarr tracks what each user watches via Plex history, then tells Sonarr to keep only a sliding window of episodes downloaded ahead of their progress — deleting behind and downloading ahead as they watch. Instead of hoarding entire series on disk, you keep a few episodes per active viewer and let Rollarr reclaim the rest.
 
 **AI DISCLOSURE**
+
 This application was developed with heavy AI input. 
 It has seen intensive testing by myself, but is very much in Alpha
 
