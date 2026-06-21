@@ -1,12 +1,18 @@
 # Rollarr
 
+
 **JIT episode buffer manager for Plex + Sonarr.**
 
 Rollarr tracks what each user watches via Plex history, then tells Sonarr to keep only a sliding window of episodes downloaded ahead of their progress — deleting behind and downloading ahead as they watch. Instead of hoarding entire series on disk, you keep a few episodes per active viewer and let Rollarr reclaim the rest.
 
+**AI DISCLOSURE**
+This application was developed with heavy AI input. 
+It has seen intensive testing by myself, but is very much in Alpha
+
+
 ## Why
 
-A 10-season show is hundreds of GB. Most of it sits unwatched. Rollarr keeps only a `buffer_size` window of episodes ahead of where each user actually is, so disk usage tracks *active viewing* rather than *full catalog*. New episodes download just in time; watched episodes get pruned automatically.
+A 10-season show is hundreds of GB. Most of it sits unwatched. Rollarr keeps only a <buffer_size> window of episodes ahead of where each user actually is, so disk usage tracks *active viewing* rather than *full catalog*. New episodes download just in time; watched episodes get pruned automatically.
 
 ## How it works
 
@@ -92,30 +98,8 @@ Env vars seed the `settings` table on **first boot only** — after that the UI 
 
 **Proxy** — `/api/v3/*` and `/sonarr-proxy/*` forward to Sonarr (Sonarr's own API key applies). Point Seerr's Sonarr server at Rollarr to scope requests to the window.
 
-## Key invariants
+## Deletions
 
-- Stored watch progress is a **forward-only floor** — cleared when a rewatch starts.
-- Unknown state fails safe: a Sonarr/Plex error aborts the reconcile rather than producing an empty expected state (which would wipe everything).
-- A show with zero requests is never reconciled (empty expected = mass delete).
-- All Sonarr/Plex work runs through the serial job queue.
-
-## Project layout
+Rollarr only works on shows requested after it's installed, or that you manually add. So you don't have to worry about it affecting all your shows on first run.
 
 ```
-cmd/rollarr/main.go   — wiring: DB, repos, clients, engine, reconciler, scheduler, proxy, router
-internal/
-  config/             — env var config
-  db/, db/repository/ — SQLite + migrations + repos
-  plex/               — Plex HTTP API + optional read-only Plex SQLite reader
-  sonarr/             — Sonarr v3 REST client
-  state/              — Engine: computes ExpectedState
-  reconcile/          — Reconciler: expected vs actual → Sonarr actions
-  scheduler/          — cron + serial JobQueue
-  proxy/              — reverse proxy scoping Seerr's requests to the window
-  webhook/            — Seerr/Jellyseerr/Plex webhooks
-  api/                — admin REST API + SSE + embedded SPA
-frontend/             — React + Vite UI
-shared/               — shared TS types
-```
-
-See `CLAUDE.md` for deeper architecture notes.
