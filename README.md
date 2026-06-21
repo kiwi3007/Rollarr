@@ -20,12 +20,12 @@ A 10-season show is hundreds of GB. Most of it sits unwatched. Rollarr keeps onl
 - **Manual adding** — a built-in Plex library browser (`GET /api/plex/library`) cross-references every Plex show against Sonarr and Rollarr's tracking state. Add a show via `POST /api/shows` without waiting for a Seerr request. You can either let Rollarr auto-discover watchers from Plex history, or override with an explicit user + starting season.
 - **Window & savings preview** — before adding, `GET /api/plex/library/{tvdbId}/preview` shows the exact window that would be kept, who the watchers are, and how many files / how much disk the first reconcile would reclaim — rendered inline per library show.
 - **Rewatch detection** — when a user requests (or is manually added at) a season at or below their highest previously-watched season, Rollarr treats it as a rewatch: the stored forward-only progress floor is cleared and old history before the rewatch timestamp is ignored, so the window resets to the rewatch start instead of pinning at the old finished position. Same semantics whether triggered by the Seerr webhook or a manual add.
-- **Auto-discovered watchers** — reconcile can pick up viewers found in Plex history with no Seerr request (`requested_season = 0`); their pre-request history is *not* filtered out, unlike Seerr-initiated requests.
+- **Auto-discovered watchers** — reconcile can pick up viewers found in Plex history with no Seerr request.
 - **"Mark as Watched" detection** — with an optional read-only mount of the Plex SQLite DB (`PLEX_DB_PATH`), Rollarr also catches episodes marked watched without a play event, merged with HTTP history and the stored floor. Handles Plex cloud↔local account ID translation.
 - **Instant reaction** — a Plex `media.scrobble` webhook reconciles immediately when an episode finishes, instead of waiting for the next scheduled pass.
-- **Savings counter & audit trail** — every delete advances `stat_bytes_deleted` / `stat_files_deleted` (exposed at `GET /api/stats`) and writes an `events` audit row explaining *why* it happened.
+- **Savings counter & audit trail** — Track how much data you've removed
 - **Inactivity pruning** — shows with no recent watch activity or requests get fully cleaned up and unmonitored.
-- **Fail-safe reconcile** — Sonarr/Plex errors abort before any delete; a show with zero requests is never reconciled (empty expected state would wipe everything).
+- **Fail-safe reconcile** — Sonarr/Plex errors abort before any delete; a show with zero requests is never reconciled.
 
 ## How it works
 
