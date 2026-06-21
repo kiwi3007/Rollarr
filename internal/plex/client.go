@@ -233,10 +233,35 @@ func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
 
 // findShowByTVDBFallback scans all TV library sections using the JSON API so
 // that both legacy (com.plexapp.agents.thetvdb) and modern (tvdb://) GUIDs
-// are checked. Modern Plex agents use plex://show/ as the primary guid and
-// store tvdb://XXXXX in the Guid array — only the JSON response includes that
-// array (XML only has the primary guid attribute).
+// are checked.
 func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
+	shows, err := c.ListLibraryShows()
+	if err != nil {
+		return "", fmt.Errorf("plex.FindShowByTVDB: %w", err)
+	}
+	for _, show := range shows {
+		if show.TVDBId == tvdbId {
+			log.Printf("[plex] FindShowByTVDB tvdb=%d → %q", tvdbId, show.Title)
+			return show.RatingKey, nil
+		}
+	}
+	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
+}
+
+// LibraryShow is one TV show entry in the Plex library.
+type LibraryShow struct {
+	RatingKey string
+	Title     string
+	Year      int
+	TVDBId    int // 0 if the show has no TVDB GUID
+}
+
+// ListLibraryShows returns every show across all TV library sections with its
+// TVDB ID resolved from either the legacy or modern agent GUID. Modern Plex
+// agents use plex://show/ as the primary guid and store tvdb://XXXXX in the
+// Guid array — only the JSON response includes that array (XML only has the
+// primary guid attribute).
+func (c *Client) ListLibraryShows() ([]LibraryShow, error) {
 	// Use XML for sections list (known to work); JSON for individual section
 	// content so we get the Guid array needed to detect modern Plex agent shows.
 	var sections struct {
@@ -247,11 +272,11 @@ func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
 		} `xml:"Directory"`
 	}
 	if err := c.getXML("/library/sections", &sections); err != nil {
-		return "", fmt.Errorf("plex.FindShowByTVDB: get sections: %w", err)
+		return nil, fmt.Errorf("plex.ListLibraryShows: get sections: %w", err)
 	}
 
-	modernGUID := fmt.Sprintf("tvdb://%d", tvdbId)
-	legacyGUID := fmt.Sprintf("com.plexapp.agents.thetvdb://%d", tvdbId)
+	const legacyPrefix = "com.plexapp.agents.thetvdb://"
+	const modernPrefix = "tvdb://"
 
 	type jsonGuid struct {
 		ID string `json:"id"`
@@ -259,37 +284,45 @@ func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
 	type jsonShow struct {
 		RatingKey string     `json:"ratingKey"`
 		Title     string     `json:"title"`
+		Year      int        `json:"year"`
 		GUID      string     `json:"guid"`
 		Guid      []jsonGuid `json:"Guid"`
 	}
-	var showsResp struct {
-		MediaContainer struct {
-			Metadata []jsonShow `json:"Metadata"`
-		} `json:"MediaContainer"`
-	}
 
+	var result []LibraryShow
 	for _, sec := range sections.Dirs {
 		if sec.Type != "show" {
 			continue
+		}
+		var showsResp struct {
+			MediaContainer struct {
+				Metadata []jsonShow `json:"Metadata"`
+			} `json:"MediaContainer"`
 		}
 		if err := c.getJSON("/library/sections/"+sec.Key+"/all?type=2&includeGuids=1", &showsResp); err != nil {
 			continue
 		}
 		for _, show := range showsResp.MediaContainer.Metadata {
-			if strings.Contains(show.GUID, legacyGUID) {
-				log.Printf("[plex] FindShowByTVDB tvdb=%d → %q (legacy GUID)", tvdbId, show.Title)
-				return show.RatingKey, nil
+			entry := LibraryShow{RatingKey: show.RatingKey, Title: show.Title, Year: show.Year}
+			if rest, ok := strings.CutPrefix(show.GUID, legacyPrefix); ok {
+				// Legacy GUIDs can carry a ?lang= suffix.
+				if i := strings.IndexAny(rest, "?/"); i >= 0 {
+					rest = rest[:i]
+				}
+				entry.TVDBId, _ = strconv.Atoi(rest)
 			}
-			for _, g := range show.Guid {
-				if g.ID == modernGUID {
-					log.Printf("[plex] FindShowByTVDB tvdb=%d → %q (modern GUID)", tvdbId, show.Title)
-					return show.RatingKey, nil
+			if entry.TVDBId == 0 {
+				for _, g := range show.Guid {
+					if rest, ok := strings.CutPrefix(g.ID, modernPrefix); ok {
+						entry.TVDBId, _ = strconv.Atoi(rest)
+						break
+					}
 				}
 			}
+			result = append(result, entry)
 		}
 	}
-
-	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
+	return result, nil
 }
 
 // GetShowTVDBID resolves a show's Plex ratingKey to its TVDB ID by reading the
