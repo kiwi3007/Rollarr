@@ -17,6 +17,7 @@ var migrations = []migration{
 	migration3,
 	migration4,
 	migration5,
+	migration6,
 }
 
 // migration0 creates the initial 4-table schema and seeds default settings.
@@ -65,6 +66,7 @@ func migration0(tx *sql.Tx) error {
 	// Seed default settings — only insert rows that don't already exist.
 	defaults := map[string]string{
 		"global_buffer_size":            "3",
+		"rewatch_window_days":          "14",
 		"global_inactivity_days":        "30",
 		"reconcile_interval_minutes":    "15",
 		"inactivity_interval_minutes":   "60",
@@ -174,6 +176,19 @@ func migration5(tx *sql.Tx) error {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("migration5: %w", err)
 		}
+	}
+	return nil
+}
+
+// migration6 adds the rewatch_window_days setting (how recently a user must
+// have played an episode behind their position for that rewatch to get its own
+// buffer window). Seeded here as well as in migration0's defaults so existing
+// installs pick it up instead of rendering blank in the settings UI.
+func migration6(tx *sql.Tx) error {
+	if _, err := tx.Exec(
+		`INSERT OR IGNORE INTO settings (key, value) VALUES ('rewatch_window_days', '14')`,
+	); err != nil {
+		return fmt.Errorf("migration6: %w", err)
 	}
 	return nil
 }

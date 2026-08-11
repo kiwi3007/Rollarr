@@ -71,7 +71,7 @@ func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize
 
 	reqs := e.previewRequests(tvdbId, showKey, manual)
 
-	perUserHighest := e.gatherHighest(showKey, tvdbId, reqs)
+	perUserHighest, perUserRecent := e.gatherHighest(showKey, tvdbId, reqs, e.shows.RewatchWindowDays())
 
 	allEpisodes := make(map[int][]int)
 	for _, ref := range lay.linear {
@@ -82,7 +82,9 @@ func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize
 		return PreviewResult{Expected: ExpectedState{}, AllEpisodes: allEpisodes}, nil
 	}
 
-	expected, windows := computeWindows(lay, reqs, perUserHighest, bufferSize, tvdbId)
+	// A preview never persists anything, so any rewatch reset it detects is
+	// discarded — the reconciler is the only writer.
+	expected, windows, _ := computeWindows(lay, reqs, perUserHighest, perUserRecent, bufferSize, tvdbId)
 
 	idToName := e.reverseUserMap()
 	watchers := make([]PreviewWatcher, 0, len(reqs))
@@ -107,8 +109,13 @@ func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize
 				w.HighestSeason, w.HighestEpisode = s, ep
 			}
 		}
-		if win, ok := windows[req.PlexUserID]; ok && win.from >= 0 {
-			w.Segments = segmentWindow(lay, win)
+		// A user can hold more than one window: their forward buffer plus, when
+		// they're partway through a rewatch of earlier episodes, a second one.
+		for _, win := range windows[req.PlexUserID] {
+			if win.from < 0 {
+				continue
+			}
+			w.Segments = append(w.Segments, segmentWindow(lay, win)...)
 		}
 		watchers = append(watchers, w)
 	}

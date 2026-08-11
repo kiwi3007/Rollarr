@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
 	"github.com/kiwi3007/rollarr/internal/plex"
@@ -27,6 +28,13 @@ const safetyBehind = 1
 type epRef struct {
 	Season  int
 	Episode int
+}
+
+// recentPlay is one episode played inside the rewatch window. The timestamp is
+// kept so a rewatch reset can be back-dated to when the rewatch actually began.
+type recentPlay struct {
+	ref      epRef
+	viewedAt time.Time
 }
 
 // layout is the linear episode structure of a show as known to Sonarr.
@@ -137,6 +145,18 @@ func NewEngine(
 type StateResult struct {
 	Expected     ExpectedState
 	UserProgress map[string]map[int]int // plexUserID → season → highestWatchedEp
+	// RewatchResets are users who had finished the show and have started it
+	// again. They have no forward watch-through left to protect, so the rewatch
+	// becomes their position outright — the caller persists this (see
+	// reconcile), which is what makes it survive the rewatch window expiring.
+	RewatchResets []RewatchReset
+}
+
+// RewatchReset marks one user whose rewatch should be persisted as a fresh
+// watch-through, starting from Since (the first play of the rewatch).
+type RewatchReset struct {
+	PlexUserID string
+	Since      time.Time
 }
 
 // ComputeExpectedState returns the set of episodes that should exist on disk
@@ -199,7 +219,7 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 		showKey = ""
 	}
 
-	perUserHighest := e.gatherHighest(showKey, tvdbId, reqs)
+	perUserHighest, perUserRecent := e.gatherHighest(showKey, tvdbId, reqs, e.shows.RewatchWindowDays())
 
 	if len(lay.linear) == 0 {
 		// Sonarr hasn't indexed any episodes yet (fresh series add).
@@ -207,21 +227,32 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 		return StateResult{Expected: ExpectedState{}, UserProgress: perUserHighest}, nil
 	}
 
-	result, _ := computeWindows(lay, reqs, perUserHighest, bufferSize, tvdbId)
+	result, _, resets := computeWindows(lay, reqs, perUserHighest, perUserRecent, bufferSize, tvdbId)
 
 	log.Printf("[state] Compute tvdb=%d result: %v", tvdbId, result)
-	return StateResult{Expected: result, UserProgress: perUserHighest}, nil
+	return StateResult{Expected: result, UserProgress: perUserHighest, RewatchResets: resets}, nil
 }
 
 // gatherHighest fetches each request's Plex watch history (HTTP + plexdb),
 // merges it with the stored high-water mark, and reduces it to a per-user
 // season → highest-watched-episode map.
-func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.UserRequest) map[string]map[int]int {
+//
+// It also returns, per user, the episodes played within the last rewatchDays.
+// The season → highest reduction discards timestamps, but recency is what
+// separates "watching an earlier season right now" from "watched it two years
+// ago" — only the former should open a second window. rewatchDays <= 0
+// disables the feature and yields an empty recent map.
+func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.UserRequest, rewatchDays int) (map[string]map[int]int, map[string][]recentPlay) {
 	// perUserHighest: userID → season → highestWatchedEpisode
 	perUserHighest := make(map[string]map[int]int)
+	// perUserRecent: userID → episodes played within the rewatch window
+	perUserRecent := make(map[string][]recentPlay)
+
+	cutoff := time.Now().AddDate(0, 0, -rewatchDays)
 
 	for _, req := range reqs {
 		highest := make(map[int]int)
+		var recent []recentPlay
 
 		if showKey != "" {
 			entries, err := e.fetchHistory(showKey, tvdbId, req)
@@ -235,6 +266,12 @@ func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.Use
 				}
 				if entry.EpisodeNum > highest[entry.SeasonNum] {
 					highest[entry.SeasonNum] = entry.EpisodeNum
+				}
+				if rewatchDays > 0 && entry.ViewedAt.After(cutoff) {
+					recent = append(recent, recentPlay{
+						ref:      epRef{Season: entry.SeasonNum, Episode: entry.EpisodeNum},
+						viewedAt: entry.ViewedAt,
+					})
 				}
 			}
 		}
@@ -253,10 +290,11 @@ func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.Use
 		}
 
 		perUserHighest[req.PlexUserID] = highest
-		log.Printf("[state] tvdb=%d user=%s highest=%v", tvdbId, req.PlexUserID, highest)
+		perUserRecent[req.PlexUserID] = recent
+		log.Printf("[state] tvdb=%d user=%s highest=%v recent=%d", tvdbId, req.PlexUserID, highest, len(recent))
 	}
 
-	return perUserHighest
+	return perUserHighest, perUserRecent
 }
 
 // userWindow is one user's buffer window as a closed range of linear indices
@@ -265,10 +303,75 @@ type userWindow struct {
 	from, to int
 }
 
+// rewatchIndex returns the linear index of a user's parallel rewatch position,
+// or -1 if they aren't rewatching.
+//
+// Going back to an earlier point is treated as a second watch-through running
+// alongside the first: it gets its own position and its own sliding buffer, and
+// advances as the user works through it. The forward position (idx) is never
+// moved, shrunk or replaced by it — the latest-season watch-through carries on
+// untouched, as does the stored last_watched_* floor.
+//
+// recent holds the episodes played within rewatch_window_days. The position is
+// the furthest-along of those that sits strictly behind idx, so the buffer
+// follows the rewatch forwards and rolls into the next season at a season
+// boundary like any other watch-through. Overlap with the forward window is
+// deliberately allowed: suppressing the window once the two draw close would
+// strand the episodes between them (rewatching at S02E04 under a forward window
+// starting at S02E07 leaves E05–E06 undownloaded). The union merges them
+// instead.
+func rewatchIndex(lay *layout, recent []recentPlay, idx int) int {
+	best := -1
+	for _, p := range recent {
+		if i := lay.positionIndex(p.ref.Season, p.ref.Episode); i < idx && i > best {
+			best = i
+		}
+	}
+	return best
+}
+
+// rewatchStart returns the timestamp of the earliest play belonging to the
+// rewatch — the plays strictly behind the forward position idx. Used to
+// back-date a rewatch reset so the rewatch's own progress isn't discarded by
+// the request-timestamp filter.
+func rewatchStart(lay *layout, recent []recentPlay, idx int) time.Time {
+	var earliest time.Time
+	for _, p := range recent {
+		if i := lay.positionIndex(p.ref.Season, p.ref.Episode); i >= idx {
+			continue
+		}
+		if earliest.IsZero() || p.viewedAt.Before(earliest) {
+			earliest = p.viewedAt
+		}
+	}
+	return earliest
+}
+
+// mergeWindows collapses overlapping or adjacent ranges so a rewatch that has
+// caught up with the forward window reports as one continuous stretch.
+func mergeWindows(wins []userWindow) []userWindow {
+	if len(wins) < 2 {
+		return wins
+	}
+	sort.Slice(wins, func(i, j int) bool { return wins[i].from < wins[j].from })
+	out := []userWindow{wins[0]}
+	for _, w := range wins[1:] {
+		last := &out[len(out)-1]
+		if w.from <= last.to+1 {
+			if w.to > last.to {
+				last.to = w.to
+			}
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
+}
+
 // computeWindows runs the window/anchor algorithm over a prepared layout and
 // per-user progress. It returns the expected episode set plus each user's
 // clamped window range (keyed by PlexUserID) for display purposes.
-func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest map[string]map[int]int, bufferSize int, tvdbId int) (ExpectedState, map[string]userWindow) {
+func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest map[string]map[int]int, perUserRecent map[string][]recentPlay, bufferSize int, tvdbId int) (ExpectedState, map[string][]userWindow, []RewatchReset) {
 	include := make(map[epRef]struct{})
 	clamp := func(from, to int) (int, int) {
 		if from < 0 {
@@ -286,7 +389,14 @@ func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest m
 		}
 	}
 
-	windows := make(map[string]userWindow, len(reqs))
+	windows := make(map[string][]userWindow, len(reqs))
+	var resets []RewatchReset
+	// open records a window and adds its episodes to the expected set.
+	open := func(userID string, from, to int) {
+		addRange(from, to)
+		from, to = clamp(from, to)
+		windows[userID] = append(windows[userID], userWindow{from: from, to: to})
+	}
 
 	for _, req := range reqs {
 		highest := perUserHighest[req.PlexUserID]
@@ -301,16 +411,46 @@ func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest m
 				}
 			}
 			idx := lay.positionIndex(ps, pe)
-			if idx+1 >= len(lay.linear) {
-				// Finished every episode Sonarr knows — no window. The window
+
+			finished := idx+1 >= len(lay.linear)
+			if finished {
+				// Finished every episode Sonarr knows — no forward window. It
 				// revives automatically when new episodes appear in Sonarr.
-				log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — no window", tvdbId, req.PlexUserID, ps, pe)
-				windows[req.PlexUserID] = userWindow{from: -1, to: -1}
-				continue
+				log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — no forward window", tvdbId, req.PlexUserID, ps, pe)
+			} else {
+				open(req.PlexUserID, idx-safetyBehind+1, idx+bufferSize)
 			}
-			addRange(idx-safetyBehind+1, idx+bufferSize)
-			from, to := clamp(idx-safetyBehind+1, idx+bufferSize)
-			windows[req.PlexUserID] = userWindow{from: from, to: to}
+
+			// A rewatch in progress behind the forward position gets its own
+			// window, so that watch-through buffers ahead just like the main
+			// one. Evaluated even for a finished user — someone who finished
+			// the show and restarted S01 is the clearest case for it.
+			if rIdx := rewatchIndex(lay, perUserRecent[req.PlexUserID], idx); rIdx >= 0 {
+				rRef := lay.linear[rIdx]
+				log.Printf("[state] tvdb=%d user=%s rewatch window at S%02dE%02d (position S%02dE%02d)",
+					tvdbId, req.PlexUserID, rRef.Season, rRef.Episode, ps, pe)
+				open(req.PlexUserID, rIdx-safetyBehind+1, rIdx+bufferSize)
+
+				// Finished the show and started it again: there is no forward
+				// watch-through left to protect, so the rewatch becomes their
+				// position for good rather than living on as a second window
+				// that evaporates when the rewatch window lapses. Back-dated to
+				// the first play of the rewatch so its progress is kept.
+				if finished {
+					if since := rewatchStart(lay, perUserRecent[req.PlexUserID], idx); !since.IsZero() {
+						resets = append(resets, RewatchReset{
+							PlexUserID: req.PlexUserID,
+							Since:      since.Add(-time.Second),
+						})
+					}
+				}
+			}
+			if len(windows[req.PlexUserID]) == 0 {
+				// Finished, and not rewatching either — nothing to report.
+				windows[req.PlexUserID] = []userWindow{{from: -1, to: -1}}
+			} else {
+				windows[req.PlexUserID] = mergeWindows(windows[req.PlexUserID])
+			}
 			continue
 		}
 
@@ -323,9 +463,7 @@ func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest m
 		if !ok {
 			startIdx = 0 // requested season unknown to Sonarr — seed from the start
 		}
-		addRange(startIdx, startIdx+bufferSize-1)
-		from, to := clamp(startIdx, startIdx+bufferSize-1)
-		windows[req.PlexUserID] = userWindow{from: from, to: to}
+		open(req.PlexUserID, startIdx, startIdx+bufferSize-1)
 	}
 
 	// Anchors: S01E01 is always available while the show has any watcher, and
@@ -352,7 +490,7 @@ func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest m
 		sort.Ints(result[s])
 	}
 
-	return result, windows
+	return result, windows, resets
 }
 
 // fetchHistory retrieves watch history for a single user from both the Plex
