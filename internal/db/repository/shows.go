@@ -191,6 +191,13 @@ func (r *ShowRepository) EffectiveBufferSize(tvdbId int) int {
 	return r.settings.GetInt("global_buffer_size", 3)
 }
 
+// RewatchWindowDays returns how recently a user must have played an episode
+// behind their current position for that rewatch to hold a buffer window of its
+// own. 0 disables rewatch windows entirely.
+func (r *ShowRepository) RewatchWindowDays() int {
+	return r.settings.GetInt("rewatch_window_days", 14)
+}
+
 // EffectiveInactivityDays returns the custom inactivity threshold for the show
 // if set, otherwise the global setting (default 30).
 func (r *ShowRepository) EffectiveInactivityDays(tvdbId int) int {

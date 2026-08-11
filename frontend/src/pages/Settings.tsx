@@ -42,6 +42,7 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
     fields: [
       { key: 'global_buffer_size',           label: 'Buffer size (episodes)',          type: 'number', hint: 'Episodes kept on disk ahead of each active request' },
       { key: 'global_inactivity_days',        label: 'Inactivity threshold (days)',     type: 'number', hint: 'Show marked inactive after this many days without activity' },
+      { key: 'rewatch_window_days',          label: 'Rewatch window (days)',           type: 'number', hint: 'Keep a second buffer when a user goes back to rewatch earlier episodes. 0 disables.' },
       { key: 'reconcile_interval_minutes',   label: 'Reconcile interval (minutes)',    type: 'number', hint: 'Requires restart to apply changes' },
       { key: 'inactivity_interval_minutes',  label: 'Inactivity check interval (minutes)', type: 'number', hint: 'Requires restart to apply changes' },
     ],

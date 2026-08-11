@@ -185,8 +185,32 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	}
 	expected := stateResult.Expected
 
+	// A user who finished the show and started it again has no forward
+	// watch-through left to protect, so their rewatch becomes their position
+	// for good — otherwise it would live only as long as the rewatch window and
+	// vanish mid-run. SetRewatching bumps request_timestamp and clears the
+	// stored floor, which together make the engine read them as a fresh watcher
+	// from the point the rewatch began.
+	resetUsers := make(map[string]bool, len(stateResult.RewatchResets))
+	for _, reset := range stateResult.RewatchResets {
+		if err := r.requests.SetRewatching(tvdbId, reset.PlexUserID, true, reset.Since); err != nil {
+			log.Printf("[reconcile] tvdb=%d persist rewatch for %s: %v", tvdbId, reset.PlexUserID, err)
+			continue
+		}
+		resetUsers[reset.PlexUserID] = true
+		log.Printf("[reconcile] tvdb=%d user=%s finished the show and restarted it — rewatch persisted from %s",
+			tvdbId, reset.PlexUserID, reset.Since.Format(time.RFC3339))
+		r.logEvent(tvdbId, "rewatch", fmt.Sprintf("user %s restarted the show after finishing it — tracking from %s",
+			reset.PlexUserID, reset.Since.Format("2006-01-02")))
+	}
+
 	// Persist per-user watch progress so the UI can display it.
 	for plexUserID, seasons := range stateResult.UserProgress {
+		if resetUsers[plexUserID] {
+			// Their high-water mark was just cleared on purpose; writing it back
+			// here would immediately undo the reset.
+			continue
+		}
 		// Find the highest season then highest episode in that season.
 		bestSeason, bestEp := 0, 0
 		for season, ep := range seasons {
