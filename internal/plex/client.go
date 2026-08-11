@@ -366,6 +366,25 @@ func (c *Client) GetShowTVDBID(ratingKey string) (int, error) {
 	return 0, fmt.Errorf("plex.GetShowTVDBID(%s): no tvdb guid", ratingKey)
 }
 
+// GetMachineIdentifier returns the local server's machineIdentifier — the
+// stable UUID Plex also reports as Server.uuid in webhook payloads. Used to
+// tell scrobbles that happened on this server apart from scrobbles the account
+// generated on somebody else's server.
+func (c *Client) GetMachineIdentifier() (string, error) {
+	var resp struct {
+		MediaContainer struct {
+			MachineIdentifier string `json:"machineIdentifier"`
+		} `json:"MediaContainer"`
+	}
+	if err := c.getJSON("/", &resp); err != nil {
+		return "", fmt.Errorf("plex.GetMachineIdentifier: %w", err)
+	}
+	if resp.MediaContainer.MachineIdentifier == "" {
+		return "", fmt.Errorf("plex.GetMachineIdentifier: empty identifier")
+	}
+	return resp.MediaContainer.MachineIdentifier, nil
+}
+
 // GetUsers returns all Plex managed/home users visible to the local server.
 func (c *Client) GetUsers() ([]PlexUser, error) {
 	var mc mediaContainerAccounts
