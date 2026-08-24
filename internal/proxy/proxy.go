@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -17,9 +18,9 @@ type Proxy struct {
 	getTarget func() string
 	intercept *Interceptor
 
-	mu     sync.RWMutex
-	rp     *httputil.ReverseProxy
-	rpURL  string
+	mu    sync.RWMutex
+	rp    *httputil.ReverseProxy
+	rpURL string
 }
 
 // NewProxy constructs a Proxy that forwards all traffic to the URL returned by
@@ -93,6 +94,17 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		rp.ServeHTTP(w, rewritten)
 
+	case r.Method == http.MethodPut:
+		if seriesId, ok := seriesUpdateID(r.URL.Path); ok {
+			rewritten, handled := p.intercept.InterceptSeriesUpdate(w, r, seriesId)
+			if handled {
+				return
+			}
+			rp.ServeHTTP(w, rewritten)
+			return
+		}
+		rp.ServeHTTP(w, r)
+
 	case r.Method == http.MethodPost && isPath(r.URL.Path, "/api/v3/command"):
 		rewritten, handled := p.intercept.InterceptSearch(w, r)
 		if handled {
@@ -103,6 +115,18 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		rp.ServeHTTP(w, r)
 	}
+}
+
+// seriesUpdateID identifies the single-series update endpoint without
+// accidentally matching /api/v3/series/editor or other collection actions.
+func seriesUpdateID(path string) (int, bool) {
+	const prefix = "/api/v3/series/"
+	trimmed := strings.TrimRight(path, "/")
+	if !strings.HasPrefix(trimmed, prefix) {
+		return 0, false
+	}
+	id, err := strconv.Atoi(strings.TrimPrefix(trimmed, prefix))
+	return id, err == nil && id > 0
 }
 
 // isPath reports whether the request path matches the target, ignoring a

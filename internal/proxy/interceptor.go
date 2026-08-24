@@ -56,18 +56,27 @@ func (c *episodeCache) set(seriesId int, episodes []sonarr.Episode) {
 // Interceptor intercepts Sonarr-bound requests that need to be filtered to the
 // computed buffer window.
 type Interceptor struct {
-	sonarr      *sonarr.Client
+	sonarr      episodeSource
 	shows       *repository.ShowRepository
-	engine      *state.Engine
+	engine      expectedStateEngine
 	cache       *episodeCache
 	OnSeriesAdd func(tvdbId int, requestedSeasons []int) // called after a successful POST /api/v3/series
 }
 
+type episodeSource interface {
+	GetSeries() ([]sonarr.Series, error)
+	GetEpisodes(seriesId int) ([]sonarr.Episode, error)
+}
+
+type expectedStateEngine interface {
+	ComputeExpectedState(tvdbId int) (state.ExpectedState, error)
+}
+
 // NewInterceptor constructs an Interceptor.
 func NewInterceptor(
-	sonarrClient *sonarr.Client,
+	sonarrClient episodeSource,
 	shows *repository.ShowRepository,
-	engine *state.Engine,
+	engine expectedStateEngine,
 ) *Interceptor {
 	return &Interceptor{
 		sonarr: sonarrClient,
@@ -75,6 +84,63 @@ func NewInterceptor(
 		engine: engine,
 		cache:  newEpisodeCache(),
 	}
+}
+
+// InterceptSeriesUpdate handles PUT /api/v3/series/{id}. Seerr updates an
+// existing series before searching it and sets every requested season to
+// monitored=true. For a Rollarr-managed show that would make every episode in
+// those seasons eligible for Sonarr's subsequent MissingEpisodeSearch. Keep
+// the series itself enabled, but leave season/episode monitoring to reconcile,
+// which applies the exact per-episode window immediately afterward.
+func (i *Interceptor) InterceptSeriesUpdate(w http.ResponseWriter, r *http.Request, pathSeriesId int) (*http.Request, bool) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read body: "+err.Error(), http.StatusBadRequest)
+		return nil, true
+	}
+
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &body); err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return r, false
+	}
+
+	// The URL identifies the resource being changed and is authoritative. Do
+	// not allow a mismatched body ID to bypass protection for a managed series.
+	seriesId := pathSeriesId
+	show, err := i.shows.FindBySonarrId(seriesId)
+	if err != nil || show == nil {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return r, false
+	}
+
+	encodedSeasons, ok := body["seasons"]
+	if !ok {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return r, false
+	}
+	var seasons []map[string]json.RawMessage
+	if err := json.Unmarshal(encodedSeasons, &seasons); err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return r, false
+	}
+	for _, season := range seasons {
+		season["monitored"] = json.RawMessage(`false`)
+	}
+	rewrittenSeasons, err := json.Marshal(seasons)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return r, false
+	}
+	body["seasons"] = rewrittenSeasons
+
+	rewritten, err := rewriteBody(r, body)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		return r, false
+	}
+	log.Printf("[proxy] PUT /api/v3/series/%d intercepted: disabled bulk season monitoring for managed tvdb=%d", seriesId, show.TVDBId)
+	return rewritten, false
 }
 
 // monitorBody is the shape of PUT /api/v3/episode/monitor.
@@ -91,7 +157,6 @@ type commandBody struct {
 	SeasonNumber *int   `json:"seasonNumber,omitempty"`
 }
 
-
 // SeriesAddResult holds context from an intercepted POST /api/v3/series so the
 // proxy can fire OnSeriesAdd after the reverse proxy completes.
 type SeriesAddResult struct {
@@ -107,7 +172,7 @@ func (r *SeriesAddResult) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
-func (r *SeriesAddResult) Header() http.Header        { return r.ResponseWriter.Header() }
+func (r *SeriesAddResult) Header() http.Header         { return r.ResponseWriter.Header() }
 func (r *SeriesAddResult) Write(b []byte) (int, error) { return r.ResponseWriter.Write(b) }
 
 func (r *SeriesAddResult) succeeded() bool {
@@ -222,7 +287,9 @@ func (i *Interceptor) InterceptMonitor(w http.ResponseWriter, r *http.Request) (
 
 // InterceptSearch handles POST /api/v3/command for search commands.
 // EpisodeSearch: filters episodeIds to the expected window.
-// SeriesSearch / SeasonSearch: converts to EpisodeSearch scoped to the window.
+// SeriesSearch / SeasonSearch / MissingEpisodeSearch: converts to EpisodeSearch
+// scoped to the window. Seerr uses MissingEpisodeSearch when re-requesting an
+// existing series, so it must not pass through with the whole series ID.
 func (i *Interceptor) InterceptSearch(w http.ResponseWriter, r *http.Request) (*http.Request, bool) {
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -255,12 +322,13 @@ func (i *Interceptor) InterceptSearch(w http.ResponseWriter, r *http.Request) (*
 		}
 		return rewritten, false
 
-	case "SeriesSearch", "SeasonSearch":
+	case "SeriesSearch", "SeasonSearch", "MissingEpisodeSearch", "CutoffUnmetEpisodeSearch":
 		if body.SeriesId == 0 {
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			return r, false
 		}
-		windowIds, err := i.windowEpisodeIds(body.SeriesId, body.SeasonNumber)
+		missingOnly := body.Name == "MissingEpisodeSearch"
+		windowIds, err := i.windowEpisodeIds(body.SeriesId, body.SeasonNumber, missingOnly)
 		if err != nil || len(windowIds) == 0 {
 			log.Printf("[proxy] %s seriesId=%d absorbed: show not managed or window empty (err=%v)", body.Name, body.SeriesId, err)
 			w.Header().Set("Content-Type", "application/json")
@@ -285,7 +353,7 @@ func (i *Interceptor) InterceptSearch(w http.ResponseWriter, r *http.Request) (*
 
 // windowEpisodeIds returns episode IDs that are within the expected buffer
 // window for the given sonarrSeriesId, optionally restricted to one season.
-func (i *Interceptor) windowEpisodeIds(sonarrSeriesId int, season *int) ([]int, error) {
+func (i *Interceptor) windowEpisodeIds(sonarrSeriesId int, season *int, missingOnly bool) ([]int, error) {
 	show, err := i.shows.FindBySonarrId(sonarrSeriesId)
 	if err != nil || show == nil {
 		return nil, fmt.Errorf("show not found for sonarrId=%d", sonarrSeriesId)
@@ -304,6 +372,9 @@ func (i *Interceptor) windowEpisodeIds(sonarrSeriesId int, season *int) ([]int, 
 	var ids []int
 	for _, ep := range episodes {
 		if season != nil && ep.SeasonNumber != *season {
+			continue
+		}
+		if missingOnly && ep.HasFile {
 			continue
 		}
 		if inExpectedState(expected, ep.SeasonNumber, ep.EpisodeNumber) {
