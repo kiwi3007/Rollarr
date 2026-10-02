@@ -174,3 +174,30 @@ func (r *UserRequestRepository) SetRewatching(tvdbId int, plexUserId string, v b
 	}
 	return nil
 }
+
+// ShouldManage decides whether a show should be under Rollarr management given
+// its user_requests and the set of excluded Plex account IDs. It is evaluated
+// when a show is onboarded and when a new Seerr request arrives; it never
+// demotes an already-managed show.
+//
+// Policy:
+//   - Only Seerr-initiated rows (RequestedSeason >= 1) count. Auto-discovered
+//     watchers (RequestedSeason == 0) never switch management on.
+//   - Any Seerr row from a non-excluded user → managed.
+//   - No Seerr rows at all (webhook lost, show added directly in Sonarr) →
+//     managed, preserving pre-exclusion behaviour.
+//   - Unresolved "seerr:<username>" rows can't be matched to an account ID and
+//     count as non-excluded.
+func ShouldManage(reqs []UserRequest, excluded map[string]bool) bool {
+	seerrRequests := 0
+	for _, req := range reqs {
+		if req.RequestedSeason < 1 {
+			continue // auto-discovered watcher — never switches management on
+		}
+		seerrRequests++
+		if !excluded[req.PlexUserID] {
+			return true
+		}
+	}
+	return seerrRequests == 0
+}

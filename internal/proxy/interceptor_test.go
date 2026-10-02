@@ -55,7 +55,8 @@ func newManagedInterceptor(t *testing.T, episodes []sonarr.Episode, expected sta
 		t.Fatalf("upsert show: %v", err)
 	}
 
-	return NewInterceptor(stubEpisodes{episodes: episodes}, shows, stubExpectedState{expected: expected})
+	requests := repository.NewUserRequestRepository(database)
+	return NewInterceptor(stubEpisodes{episodes: episodes}, shows, requests, settings, stubExpectedState{expected: expected})
 }
 
 func TestMissingEpisodeSearchIsScopedToMissingWindowEpisodes(t *testing.T) {
@@ -148,5 +149,52 @@ func TestSeriesUpdateID(t *testing.T) {
 		if got, ok := seriesUpdateID(path); ok {
 			t.Errorf("seriesUpdateID(%q) = (%d, true), want no match", path, got)
 		}
+	}
+}
+
+func TestSeriesAddByExcludedUserPassesThrough(t *testing.T) {
+	interceptor := newManagedInterceptor(t, nil, nil)
+	if err := interceptor.settings.Set("excluded_user_ids", "111"); err != nil {
+		t.Fatal(err)
+	}
+	if err := interceptor.requests.Upsert(repository.UserRequest{PlexUserID: "111", TVDBId: 81189, RequestedSeason: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"tvdbId":81189,"addOptions":{"searchForMissingEpisodes":true}}`
+	req := httptest.NewRequest("POST", "/api/v3/series", strings.NewReader(body))
+	result, handled := interceptor.InterceptSeriesAdd(httptest.NewRecorder(), req)
+	if handled {
+		t.Fatal("series add was absorbed")
+	}
+	var got struct {
+		AddOptions map[string]bool `json:"addOptions"`
+	}
+	if err := json.NewDecoder(result.Request.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !got.AddOptions["searchForMissingEpisodes"] {
+		t.Error("search-on-add was disabled for an excluded user's request")
+	}
+}
+
+func TestSearchOnUnmanagedShowPassesThrough(t *testing.T) {
+	interceptor := newManagedInterceptor(t, nil, nil)
+	if err := interceptor.shows.SetManaged(70851, false); err != nil {
+		t.Fatal(err)
+	}
+
+	body := `{"name":"SeriesSearch","seriesId":275}`
+	req := httptest.NewRequest("POST", "/api/v3/command", strings.NewReader(body))
+	rewritten, handled := interceptor.InterceptSearch(httptest.NewRecorder(), req)
+	if handled {
+		t.Fatal("search on unmanaged show was absorbed")
+	}
+	var got commandBody
+	if err := json.NewDecoder(rewritten.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.Name != "SeriesSearch" || got.SeriesId != 275 {
+		t.Errorf("command rewritten to %+v, want unchanged SeriesSearch", got)
 	}
 }

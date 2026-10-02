@@ -45,6 +45,8 @@ func NewRouter(
 		r.Get("/api/shows", showsH.list)
 		r.Get("/api/shows/{tvdbId}", showsH.detail)
 		r.Post("/api/shows/{tvdbId}/reconcile", showsH.reconcile)
+		r.Put("/api/shows/{tvdbId}/managed", showsH.setManaged)
+		r.Get("/api/plex/users", showsH.plexUsers)
 
 		r.Get("/api/stats", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(w, map[string]int64{

@@ -160,6 +160,12 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	if show == nil {
 		return fmt.Errorf("reconcile(%d): show not found", tvdbId)
 	}
+	// Unmanaged shows (requested only by excluded users) are tracked but
+	// never touched — no discovery, deletes, monitoring or searches.
+	if show.Unmanaged {
+		log.Printf("[reconcile] tvdb=%d (%s) is unmanaged — skipping", tvdbId, show.Title)
+		return nil
+	}
 
 	// 1a. Auto-discover watchers who started playing without a Seerr request.
 	if showKey, err := r.plex.FindShowByTVDB(tvdbId); err == nil {
@@ -384,6 +390,10 @@ func (r *Reconciler) ReconcileAll() error {
 // the effective inactivity threshold, then deletes all their episode files and
 // unmonitors all episodes.
 func (r *Reconciler) PruneInactive() error {
+	// Revive first so a show whose new season just aired isn't re-evaluated
+	// against the old inactivity clock below.
+	r.ReviveInactive()
+
 	shows, err := r.shows.FindByStatus("active")
 	if err != nil {
 		return fmt.Errorf("prune inactive: find active shows: %w", err)
@@ -391,12 +401,16 @@ func (r *Reconciler) PruneInactive() error {
 
 	now := time.Now()
 	for _, show := range shows {
+		if show.Unmanaged {
+			continue
+		}
 		// Effective last activity = max(last watch event, newest request).
 		// Including request timestamps protects a freshly (re-)added show whose
 		// only watch history predates the request — without it, a re-add of a
 		// show with years-old history would be pruned within the hour.
 		last := show.LastActivityAt
-		if reqs, err := r.requests.FindByShow(show.TVDBId); err == nil {
+		reqs, reqErr := r.requests.FindByShow(show.TVDBId)
+		if reqErr == nil {
 			for _, req := range reqs {
 				if last == nil || req.RequestTimestamp.After(*last) {
 					t := req.RequestTimestamp
@@ -414,16 +428,23 @@ func (r *Reconciler) PruneInactive() error {
 			continue
 		}
 
-		log.Printf("[reconcile] show %d (%s) inactive — cleaning up", show.TVDBId, show.Title)
-
-		// Clean up in Sonarr FIRST, mark inactive last: PruneInactive only
-		// iterates active shows, so flipping the status before a failed cleanup
-		// would strand the files forever.
 		episodes, err := r.sonarr.GetEpisodes(show.SonarrId)
 		if err != nil {
 			log.Printf("[reconcile] get episodes for inactive show %d: %v (will retry next run)", show.TVDBId, err)
 			continue
 		}
+
+		// New episodes airing after a caught-up watcher's position count as
+		// activity: they get the full threshold to start watching them.
+		if aired := nextEpisodeAiredAt(episodes, reqs, now); aired != nil && now.Sub(*aired) < threshold {
+			continue
+		}
+
+		log.Printf("[reconcile] show %d (%s) inactive — cleaning up", show.TVDBId, show.Title)
+
+		// Clean up in Sonarr FIRST, mark inactive last: PruneInactive only
+		// iterates active shows, so flipping the status before a failed cleanup
+		// would strand the files forever.
 
 		var allIds []int
 		deleted := 0
@@ -444,11 +465,22 @@ func (r *Reconciler) PruneInactive() error {
 			}
 		}
 
+		// A watcher who caught up is waiting for new episodes, not gone: arm
+		// a revival for when the next episode airs.
+		detail := fmt.Sprintf("no activity for %d+ days — removed %d files, series unmonitored", days, deleted)
+		if ms, me, ok := caughtUpMarker(episodes, reqs, now); ok {
+			if err := r.shows.SetReviveMarker(show.TVDBId, &ms, &me); err != nil {
+				log.Printf("[reconcile] set revive marker %d: %v", show.TVDBId, err)
+			}
+			detail += fmt.Sprintf("; will reactivate when an episode after S%02dE%02d airs", ms, me)
+		} else if err := r.shows.SetReviveMarker(show.TVDBId, nil, nil); err != nil {
+			log.Printf("[reconcile] clear revive marker %d: %v", show.TVDBId, err)
+		}
+
 		if err := r.shows.UpdateStatus(show.TVDBId, "inactive"); err != nil {
 			log.Printf("[reconcile] update status %d: %v", show.TVDBId, err)
 		}
-		r.logEvent(show.TVDBId, "pruned",
-			fmt.Sprintf("no activity for %d+ days — removed %d files, series unmonitored", days, deleted))
+		r.logEvent(show.TVDBId, "pruned", detail)
 	}
 
 	// Keep the audit table bounded.

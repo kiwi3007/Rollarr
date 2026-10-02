@@ -58,6 +58,8 @@ func (c *episodeCache) set(seriesId int, episodes []sonarr.Episode) {
 type Interceptor struct {
 	sonarr      episodeSource
 	shows       *repository.ShowRepository
+	requests    *repository.UserRequestRepository
+	settings    *repository.SettingsRepository
 	engine      expectedStateEngine
 	cache       *episodeCache
 	OnSeriesAdd func(tvdbId int, requestedSeasons []int) // called after a successful POST /api/v3/series
@@ -76,14 +78,34 @@ type expectedStateEngine interface {
 func NewInterceptor(
 	sonarrClient episodeSource,
 	shows *repository.ShowRepository,
+	requests *repository.UserRequestRepository,
+	settings *repository.SettingsRepository,
 	engine expectedStateEngine,
 ) *Interceptor {
 	return &Interceptor{
-		sonarr: sonarrClient,
-		shows:  shows,
-		engine: engine,
-		cache:  newEpisodeCache(),
+		sonarr:   sonarrClient,
+		shows:    shows,
+		requests: requests,
+		settings: settings,
+		engine:   engine,
+		cache:    newEpisodeCache(),
 	}
+}
+
+// managedShow returns the Rollarr show for a Sonarr series ID, or nil when the
+// series is unknown or unmanaged (requested only by excluded users).
+func (i *Interceptor) managedShow(sonarrSeriesId int) *repository.Show {
+	show, err := i.shows.FindBySonarrId(sonarrSeriesId)
+	if err != nil || show == nil || show.Unmanaged {
+		return nil
+	}
+	return show
+}
+
+// isUnmanaged reports whether the series is tracked by Rollarr but unmanaged.
+func (i *Interceptor) isUnmanaged(sonarrSeriesId int) bool {
+	show, err := i.shows.FindBySonarrId(sonarrSeriesId)
+	return err == nil && show != nil && show.Unmanaged
 }
 
 // InterceptSeriesUpdate handles PUT /api/v3/series/{id}. Seerr updates an
@@ -108,8 +130,8 @@ func (i *Interceptor) InterceptSeriesUpdate(w http.ResponseWriter, r *http.Reque
 	// The URL identifies the resource being changed and is authoritative. Do
 	// not allow a mismatched body ID to bypass protection for a managed series.
 	seriesId := pathSeriesId
-	show, err := i.shows.FindBySonarrId(seriesId)
-	if err != nil || show == nil {
+	show := i.managedShow(seriesId)
+	if show == nil {
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 		return r, false
 	}
@@ -221,6 +243,18 @@ func (i *Interceptor) InterceptSeriesAdd(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Seerr's webhook fires before this POST, so the requester is already in
+	// user_requests. Shows requested only by excluded users pass through
+	// untouched: Sonarr's own search-on-add downloads the full request.
+	if tvdbId != 0 && i.requests != nil && i.settings != nil {
+		if reqs, err := i.requests.FindByShow(tvdbId); err == nil &&
+			!repository.ShouldManage(reqs, i.settings.ExcludedUsers()) {
+			log.Printf("[proxy] POST /api/v3/series tvdbId=%d passed through: requested by excluded user(s)", tvdbId)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			return &SeriesAddResult{ResponseWriter: w, Request: r, TvdbId: tvdbId, RequestedSeasons: requestedSeasons}, false
+		}
+	}
+
 	addOpts := make(map[string]json.RawMessage)
 	if raw, ok := body["addOptions"]; ok {
 		_ = json.Unmarshal(raw, &addOpts)
@@ -323,7 +357,7 @@ func (i *Interceptor) InterceptSearch(w http.ResponseWriter, r *http.Request) (*
 		return rewritten, false
 
 	case "SeriesSearch", "SeasonSearch", "MissingEpisodeSearch", "CutoffUnmetEpisodeSearch":
-		if body.SeriesId == 0 {
+		if body.SeriesId == 0 || i.isUnmanaged(body.SeriesId) {
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			return r, false
 		}
@@ -354,9 +388,9 @@ func (i *Interceptor) InterceptSearch(w http.ResponseWriter, r *http.Request) (*
 // windowEpisodeIds returns episode IDs that are within the expected buffer
 // window for the given sonarrSeriesId, optionally restricted to one season.
 func (i *Interceptor) windowEpisodeIds(sonarrSeriesId int, season *int, missingOnly bool) ([]int, error) {
-	show, err := i.shows.FindBySonarrId(sonarrSeriesId)
-	if err != nil || show == nil {
-		return nil, fmt.Errorf("show not found for sonarrId=%d", sonarrSeriesId)
+	show := i.managedShow(sonarrSeriesId)
+	if show == nil {
+		return nil, fmt.Errorf("no managed show for sonarrId=%d", sonarrSeriesId)
 	}
 
 	expected, err := i.engine.ComputeExpectedState(show.TVDBId)
@@ -406,9 +440,9 @@ func (i *Interceptor) filterToExpected(episodeIds []int) ([]int, error) {
 
 		expected, ok := expectedCache[ep.SeriesId]
 		if !ok {
-			show, err := i.shows.FindBySonarrId(ep.SeriesId)
-			if err != nil || show == nil {
-				// Unknown show — allow through.
+			show := i.managedShow(ep.SeriesId)
+			if show == nil {
+				// Unknown or unmanaged show — allow through.
 				allowed = append(allowed, epId)
 				continue
 			}

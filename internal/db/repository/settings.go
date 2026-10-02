@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/kiwi3007/rollarr/internal/config"
 )
@@ -61,6 +62,18 @@ func (r *SettingsRepository) GetInt64(key string, def int64) int64 {
 		return def
 	}
 	return n
+}
+
+// ExcludedUsers returns the set of Plex account IDs whose Seerr requests do not
+// put a show under management (excluded_user_ids, comma-separated).
+func (r *SettingsRepository) ExcludedUsers() map[string]bool {
+	excluded := make(map[string]bool)
+	for _, id := range strings.Split(r.Get("excluded_user_ids"), ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			excluded[id] = true
+		}
+	}
+	return excluded
 }
 
 // AddInt64 atomically adds delta to a numeric counter setting. Safe under the

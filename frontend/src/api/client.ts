@@ -11,6 +11,7 @@ export interface ShowSummary {
   sonarr_id: number;
   title: string;
   status: 'active' | 'inactive' | 'removed';
+  managed: boolean;
   effective_buffer_size: number;
   active_request_count: number;
   last_activity_at: string | null;
@@ -60,6 +61,11 @@ export interface ShowDetail extends ShowSummary {
   events: ShowEvent[];
 }
 
+export interface PlexUser {
+  id: string;
+  username: string;
+}
+
 export type SettingsMap = Record<string, string>;
 
 // API client
@@ -84,6 +90,9 @@ export const api = {
   reconcileShow: (tvdbId: number) => apiFetch<{queued: boolean}>(`/api/shows/${tvdbId}/reconcile`, { method: 'POST' }),
   deleteRequest: (tvdbId: number, plexUserId: string) =>
     apiFetch<{ok: boolean}>(`/api/shows/${tvdbId}/requests/${encodeURIComponent(plexUserId)}`, { method: 'DELETE' }),
+  setManaged: (tvdbId: number, managed: boolean) =>
+    apiFetch<{ok: boolean; managed: boolean}>(`/api/shows/${tvdbId}/managed`, { method: 'PUT', body: JSON.stringify({ managed }) }),
+  getPlexUsers: () => apiFetch<PlexUser[]>('/api/plex/users'),
   getFlags: () => apiFetch<Flag[]>('/api/flags'),
   updateFlag: (id: number, status: 'resolved' | 'ignored') =>
     apiFetch<Flag>(`/api/flags/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),

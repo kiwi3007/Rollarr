@@ -167,13 +167,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve plexUsername → plexUserId via Plex account list, falling back to email.
 	plexUserId := h.resolvePlexUser(plexUsername, email)
 
-	// Upsert show row from Sonarr. Seerr fires the webhook before sending
-	// POST /api/v3/series to Sonarr, so the series may not exist yet — log and
-	// continue. The proxy's OnSeriesAdd will upsert the show once Sonarr confirms.
-	if err := h.upsertShow(tvdbId); err != nil {
-		log.Printf("[webhook] upsert show %d: %v (will retry via proxy onboard)", tvdbId, err)
-	}
-
 	// Treat missing season as 1 (whole-show request implies starting from S01).
 	requestedSeason := payload.Request.Season
 	if requestedSeason <= 0 {
@@ -205,6 +198,38 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isRewatching {
 		if err := h.requests.ClearWatchProgress(tvdbId, plexUserId); err != nil {
 			log.Printf("[webhook] clear progress for rewatch tvdb=%d user=%s: %v", tvdbId, plexUserId, err)
+		}
+	}
+
+	// Decide management now that this request is recorded. Excluded users'
+	// requests don't start management, but a non-excluded request promotes an
+	// unmanaged show. A managed show is never demoted.
+	allReqs, err := h.requests.FindByShow(tvdbId)
+	if err != nil {
+		log.Printf("[webhook] load requests tvdb=%d: %v", tvdbId, err)
+	}
+	manage := repository.ShouldManage(allReqs, h.settings.ExcludedUsers())
+
+	// Upsert show row from Sonarr. Seerr fires the webhook before sending
+	// POST /api/v3/series to Sonarr, so the series may not exist yet — log and
+	// continue. The proxy's OnSeriesAdd will upsert the show once Sonarr confirms.
+	if err := h.upsertShow(tvdbId, manage); err != nil {
+		log.Printf("[webhook] upsert show %d: %v (will retry via proxy onboard)", tvdbId, err)
+	}
+
+	show, _ := h.shows.FindByTVDB(tvdbId)
+	if show != nil && show.Unmanaged {
+		if !manage {
+			log.Printf("[webhook] tvdb=%d is unmanaged (requested by excluded user %s) — not reconciling", tvdbId, plexUserId)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]bool{"queued": false}) //nolint:errcheck
+			return
+		}
+		if err := h.shows.SetManaged(tvdbId, true); err != nil {
+			log.Printf("[webhook] set managed tvdb=%d: %v", tvdbId, err)
+		} else {
+			log.Printf("[webhook] tvdb=%d now managed: requested by managed user %s", tvdbId, plexUserId)
 		}
 	}
 
@@ -243,8 +268,9 @@ func (h *Handler) resolvePlexUser(username, email string) string {
 	return "seerr:" + username
 }
 
-// upsertShow fetches the show from Sonarr and upserts it into the DB.
-func (h *Handler) upsertShow(tvdbId int) error {
+// upsertShow fetches the show from Sonarr and upserts it into the DB. manage
+// only applies when the row is first created.
+func (h *Handler) upsertShow(tvdbId int, manage bool) error {
 	series, err := h.sonarr.GetSeriesByTVDB(tvdbId)
 	if err != nil {
 		return fmt.Errorf("get series from sonarr: %w", err)
@@ -257,6 +283,7 @@ func (h *Handler) upsertShow(tvdbId int) error {
 		PosterURL: series.PosterURL(),
 		FanartURL: series.FanartURL(),
 		Status:    "active",
+		Unmanaged: !manage,
 	}
 	return h.shows.Upsert(show)
 }

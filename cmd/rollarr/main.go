@@ -109,7 +109,7 @@ func main() {
 	})
 
 	// ── Proxy ────────────────────────────────────────────────────────────────
-	interceptor := proxy.NewInterceptor(sonarrClient, shows, engine)
+	interceptor := proxy.NewInterceptor(sonarrClient, shows, requests, settings, engine)
 	interceptor.OnSeriesAdd = func(tvdbId int, requestedSeasons []int) {
 		log.Printf("[proxy] onboard tvdb=%d: waiting for Sonarr to index series, requestedSeasons=%v", tvdbId, requestedSeasons)
 
@@ -133,6 +133,15 @@ func main() {
 		}
 
 		queue.Enqueue(func() {
+			// Management is decided at onboarding: a show requested only by
+			// excluded users is tracked but never touched. Upsert keeps the
+			// flag of an existing row (e.g. one the webhook already created).
+			reqs, err := requests.FindByShow(tvdbId)
+			if err != nil {
+				log.Printf("[proxy] onboard tvdb=%d: load requests: %v", tvdbId, err)
+			}
+			manage := repository.ShouldManage(reqs, settings.ExcludedUsers())
+
 			if err := shows.Upsert(repository.Show{
 				TVDBId:    tvdbId,
 				SonarrId:  series.ID,
@@ -140,8 +149,17 @@ func main() {
 				PosterURL: series.PosterURL(),
 				FanartURL: series.FanartURL(),
 				Status:    "active",
+				Unmanaged: !manage,
 			}); err != nil {
 				log.Printf("[proxy] onboard tvdb=%d: upsert show: %v", tvdbId, err)
+				return
+			}
+
+			if show, _ := shows.FindByTVDB(tvdbId); show != nil && show.Unmanaged {
+				log.Printf("[proxy] onboard tvdb=%d (%s) unmanaged: requested by excluded user(s)", tvdbId, series.Title)
+				if err := events.Insert(tvdbId, "onboarded", fmt.Sprintf("%q added via Seerr as unmanaged (excluded requester)", series.Title)); err != nil {
+					log.Printf("[proxy] onboard event: %v", err)
+				}
 				return
 			}
 

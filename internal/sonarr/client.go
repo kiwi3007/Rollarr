@@ -53,13 +53,14 @@ func (s *Series) FanartURL() string {
 
 // Episode represents a Sonarr episode resource.
 type Episode struct {
-	ID            int  `json:"id"`
-	SeriesId      int  `json:"seriesId"`
-	SeasonNumber  int  `json:"seasonNumber"`
-	EpisodeNumber int  `json:"episodeNumber"`
-	HasFile       bool `json:"hasFile"`
-	EpisodeFileId int  `json:"episodeFileId"`
-	Monitored     bool `json:"monitored"`
+	ID            int        `json:"id"`
+	SeriesId      int        `json:"seriesId"`
+	SeasonNumber  int        `json:"seasonNumber"`
+	EpisodeNumber int        `json:"episodeNumber"`
+	HasFile       bool       `json:"hasFile"`
+	EpisodeFileId int        `json:"episodeFileId"`
+	Monitored     bool       `json:"monitored"`
+	AirDateUtc    *time.Time `json:"airDateUtc"` // nil when Sonarr has no air date (TBA)
 }
 
 // EpisodeFile represents a Sonarr episode file resource.

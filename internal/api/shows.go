@@ -31,6 +31,7 @@ type ShowSummary struct {
 	SonarrId            int              `json:"sonarr_id"`
 	Title               string           `json:"title"`
 	Status              string           `json:"status"`
+	Managed             bool             `json:"managed"`
 	EffectiveBufferSize int              `json:"effective_buffer_size"`
 	ActiveRequestCount  int              `json:"active_request_count"`
 	LastActivityAt      *time.Time       `json:"last_activity_at"`
@@ -157,6 +158,7 @@ func (h *showsHandler) list(w http.ResponseWriter, r *http.Request) {
 			SonarrId:            show.SonarrId,
 			Title:               show.Title,
 			Status:              show.Status,
+			Managed:             !show.Unmanaged,
 			EffectiveBufferSize: bufferSize,
 			ActiveRequestCount:  len(reqs),
 			LastActivityAt:      show.LastActivityAt,
@@ -233,6 +235,7 @@ func (h *showsHandler) detail(w http.ResponseWriter, r *http.Request) {
 		SonarrId:            show.SonarrId,
 		Title:               show.Title,
 		Status:              show.Status,
+		Managed:             !show.Unmanaged,
 		EffectiveBufferSize: bufferSize,
 		ActiveRequestCount:  len(reqs),
 		LastActivityAt:      show.LastActivityAt,
@@ -273,6 +276,66 @@ func (h *showsHandler) reconcile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]bool{"queued": true}) //nolint:errcheck
+}
+
+// setManaged handles PUT /api/shows/{tvdbId}/managed with {"managed": bool}.
+// Unmanaging freezes the show as-is. Managing it reconciles immediately, which
+// prunes everything outside the current windows.
+func (h *showsHandler) setManaged(w http.ResponseWriter, r *http.Request) {
+	tvdbId, ok := parseTVDBId(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Managed bool `json:"managed"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	show, err := h.shows.FindByTVDB(tvdbId)
+	if err != nil {
+		http.Error(w, "db error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if show == nil {
+		http.Error(w, "show not found", http.StatusNotFound)
+		return
+	}
+	if err := h.shows.SetManaged(tvdbId, body.Managed); err != nil {
+		http.Error(w, "db error: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if h.events != nil {
+		action := "unmanaged"
+		if body.Managed {
+			action = "managed"
+		}
+		_ = h.events.Insert(tvdbId, action, "set manually via UI")
+	}
+	if body.Managed {
+		h.queue.Enqueue(func() {
+			_ = h.reconciler.ReconcileShow(tvdbId)
+		})
+	}
+	writeJSON(w, map[string]bool{"ok": true, "managed": body.Managed})
+}
+
+// plexUsers handles GET /api/plex/users — the Plex accounts available for the
+// managed-users setting.
+func (h *showsHandler) plexUsers(w http.ResponseWriter, _ *http.Request) {
+	type plexUser struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+	}
+	users := []plexUser{}
+	for id, name := range buildIDToNameMap(h.plex) {
+		users = append(users, plexUser{ID: strconv.Itoa(id), Username: name})
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return strings.ToLower(users[i].Username) < strings.ToLower(users[j].Username)
+	})
+	writeJSON(w, users)
 }
 
 func parseTVDBId(w http.ResponseWriter, r *http.Request) (int, bool) {

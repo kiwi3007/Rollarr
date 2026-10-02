@@ -17,6 +17,8 @@ var migrations = []migration{
 	migration3,
 	migration4,
 	migration5,
+	migration6,
+	migration7,
 }
 
 // migration0 creates the initial 4-table schema and seeds default settings.
@@ -173,6 +175,38 @@ func migration5(tx *sql.Tx) error {
 	for _, stmt := range stmts {
 		if _, err := tx.Exec(stmt); err != nil {
 			return fmt.Errorf("migration5: %w", err)
+		}
+	}
+	return nil
+}
+
+// migration6 adds the per-show managed flag and the excluded-user setting.
+// Existing shows default to managed: excluding a user only affects shows
+// onboarded afterwards.
+func migration6(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE shows ADD COLUMN managed INTEGER NOT NULL DEFAULT 1`,
+		`INSERT OR IGNORE INTO settings (key, value) VALUES ('excluded_user_ids', '')`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration6: %w", err)
+		}
+	}
+	return nil
+}
+
+// migration7 adds the revival marker for inactivity-pruned shows: the last
+// aired episode at prune time, recorded only when a watcher had caught up to
+// it. New aired episodes past the marker reactivate the show.
+func migration7(tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE shows ADD COLUMN revive_after_season  INTEGER`,
+		`ALTER TABLE shows ADD COLUMN revive_after_episode INTEGER`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migration7: %w", err)
 		}
 	}
 	return nil
