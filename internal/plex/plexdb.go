@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -18,6 +19,35 @@ import (
 // (which does not appear in the HTTP history API).
 type PlexDB struct {
 	db *sql.DB
+
+	// ownerID resolves the server owner's plex.tv account ID, which differs
+	// from the owner's local ID (always 1). Resolved lazily and cached on
+	// success. Nil means unknown.
+	ownerID     func() (int, error)
+	ownerMu     sync.Mutex
+	ownerCached int
+}
+
+// SetOwnerIDResolver sets how the server owner's plex.tv account ID is found
+// (normally Client.OwnerAccountID).
+func (p *PlexDB) SetOwnerIDResolver(fn func() (int, error)) {
+	p.ownerMu.Lock()
+	defer p.ownerMu.Unlock()
+	p.ownerID = fn
+}
+
+// owner returns the owner's plex.tv account ID, or 0 if unknown.
+func (p *PlexDB) owner() int {
+	p.ownerMu.Lock()
+	defer p.ownerMu.Unlock()
+	if p.ownerCached == 0 && p.ownerID != nil {
+		if id, err := p.ownerID(); err == nil {
+			p.ownerCached = id
+		} else {
+			log.Printf("[plexdb] owner account lookup failed: %v", err)
+		}
+	}
+	return p.ownerCached
 }
 
 // MarkedWatched represents an episode that was manually marked as watched.
@@ -61,22 +91,25 @@ func OpenPlexDB(path string) (*PlexDB, error) {
 // resolveLocalAccountID translates a cloud account ID to its local SQLite
 // account ID. In Plex's local DB:
 //   - Non-admin users: local id == cloud id
-//   - Admin: local id is always 1; their cloud id differs (obtained from
-//     plex.tv, not from the local server /accounts endpoint)
+//   - Owner: local id is always 1; their cloud id differs
 //
-// If the cloud ID is not found in the local accounts table we assume the caller
-// is the admin and return 1.
+// It returns -1 when the account can't be matched. The old fallback treated
+// every unknown ID as the owner, so an unrecognised user inherited the
+// owner's watch history (and the owner's window drove their deletes).
 func (p *PlexDB) resolveLocalAccountID(cloudID int) int {
 	if cloudID <= 0 {
 		return 0
 	}
 	var count int
 	err := p.db.QueryRow(`SELECT COUNT(*) FROM accounts WHERE id = ?`, cloudID).Scan(&count)
-	if err != nil || count == 0 {
-		log.Printf("[plexdb] account_id=%d not in local accounts table — treating as admin (local id=1)", cloudID)
+	if err == nil && count > 0 {
+		return cloudID
+	}
+	if owner := p.owner(); owner > 0 && owner == cloudID {
 		return 1
 	}
-	return cloudID
+	log.Printf("[plexdb] account_id=%d not in local accounts and not the owner — no plexdb history", cloudID)
+	return -1
 }
 
 // GetMarkedWatched returns episodes for the given Plex ratingKey that were
@@ -92,6 +125,9 @@ func (p *PlexDB) GetMarkedWatched(plexRatingKey string, accountId int) ([]Marked
 	localID := 0
 	if accountId > 0 {
 		localID = p.resolveLocalAccountID(accountId)
+		if localID < 0 {
+			return nil, nil
+		}
 		log.Printf("[plexdb] GetMarkedWatched ratingKey=%s cloudAccountId=%d localAccountId=%d", plexRatingKey, accountId, localID)
 	}
 

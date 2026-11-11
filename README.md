@@ -81,7 +81,7 @@ Env vars seed the `settings` table on **first boot only** — after that the UI 
 
 | Var | Purpose |
 |-----|---------|
-| `ROLLARR_API_TOKEN` | Bearer token for `/api/*` (empty = no auth, dev only) |
+| `ROLLARR_API_TOKEN` | Bearer token for `/api/*` (empty = no auth, dev only). The web UI asks for it once per browser. |
 | `SONARR_URL` / `SONARR_API_KEY` | Sonarr v3 connection |
 | `PLEX_URL` / `PLEX_TOKEN` | Plex connection |
 | `PLEX_DB_PATH` | Optional path to Plex SQLite DB — enables "Mark as Watched" detection |

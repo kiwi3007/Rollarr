@@ -39,7 +39,7 @@ func (f *flexInt) UnmarshalJSON(data []byte) error {
 }
 
 // EnqueueFunc is the function signature used to enqueue a background job.
-type EnqueueFunc func(func())
+type EnqueueFunc func(func()) bool
 
 // Handler handles Seerr/Jellyseerr webhook payloads.
 type Handler struct {
@@ -66,6 +66,12 @@ type SeerrPayload struct {
 		RequestedByEmail    string `json:"requestedBy_email"`
 		Season              int    `json:"season"` // 0 when absent (whole-show request)
 	} `json:"request"`
+	// Overseerr's default template lists requested seasons here, e.g.
+	// {"name": "Requested Seasons", "value": "2, 3"}.
+	Extra []struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	} `json:"extra"`
 	// Jellyseerr nested structure.
 	RequestedBy struct {
 		PlexUsername string `json:"plexUsername"`
@@ -167,21 +173,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Resolve plexUsername → plexUserId via Plex account list, falling back to email.
 	plexUserId := h.resolvePlexUser(plexUsername, email)
 
-	// Upsert show row from Sonarr. Seerr fires the webhook before sending
-	// POST /api/v3/series to Sonarr, so the series may not exist yet — log and
-	// continue. The proxy's OnSeriesAdd will upsert the show once Sonarr confirms.
-	if err := h.upsertShow(tvdbId); err != nil {
-		log.Printf("[webhook] upsert show %d: %v (will retry via proxy onboard)", tvdbId, err)
-	}
-
-	// Treat missing season as 1 (whole-show request implies starting from S01).
-	requestedSeason := payload.Request.Season
-	if requestedSeason <= 0 {
+	// Which season the user asked for. When the payload doesn't say, the
+	// season is unknown — not S01. Defaulting to 1 made every re-request by
+	// someone past season 1 look like a rewatch, which wiped their progress
+	// and deleted their current-season files.
+	requestedSeason, isRewatching := payloadSeason(payload), false
+	if requestedSeason > 0 {
+		isRewatching = h.isRewatching(tvdbId, plexUserId, requestedSeason)
+	} else {
 		requestedSeason = 1
+		if existing := h.findRequest(tvdbId, plexUserId); existing != nil {
+			// Re-request without a season: keep what we already knew.
+			if existing.RequestedSeason >= 1 {
+				requestedSeason = existing.RequestedSeason
+			}
+			isRewatching = existing.IsRewatching
+		}
+		log.Printf("[webhook] tvdb=%d: payload has no season — using S%02d, rewatch=%v", tvdbId, requestedSeason, isRewatching)
 	}
-
-	// Check if user is rewatching.
-	isRewatching := h.isRewatching(tvdbId, plexUserId, requestedSeason)
 
 	// Upsert user request. requested_season is written here so re-requests of a
 	// series that already exists in Sonarr (where the proxy's series-add hook
@@ -208,8 +217,41 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Enqueue reconciliation (non-blocking).
-	h.enqueue(func() {
+	// Decide management now that this request is recorded. Excluded users'
+	// requests don't start management, but a non-excluded request promotes an
+	// unmanaged show. A managed show is never demoted.
+	allReqs, err := h.requests.FindByShow(tvdbId)
+	if err != nil {
+		log.Printf("[webhook] load requests tvdb=%d: %v", tvdbId, err)
+	}
+	manage := repository.ShouldManage(allReqs, h.settings.ExcludedUsers())
+
+	// Upsert show row from Sonarr. Seerr fires the webhook before sending
+	// POST /api/v3/series to Sonarr, so the series may not exist yet — log and
+	// continue. The proxy's OnSeriesAdd will upsert the show once Sonarr confirms.
+	if err := h.upsertShow(tvdbId, manage); err != nil {
+		log.Printf("[webhook] upsert show %d: %v (will retry via proxy onboard)", tvdbId, err)
+	}
+
+	show, _ := h.shows.FindByTVDB(tvdbId)
+	if show != nil && show.Unmanaged {
+		if !manage {
+			log.Printf("[webhook] tvdb=%d is unmanaged (requested by excluded user %s) — not reconciling", tvdbId, plexUserId)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			json.NewEncoder(w).Encode(map[string]bool{"queued": false}) //nolint:errcheck
+			return
+		}
+		if err := h.shows.SetManaged(tvdbId, true); err != nil {
+			log.Printf("[webhook] set managed tvdb=%d: %v", tvdbId, err)
+		} else {
+			log.Printf("[webhook] tvdb=%d now managed: requested by managed user %s", tvdbId, plexUserId)
+		}
+	}
+
+	// Enqueue reconciliation (non-blocking). If the queue is full the next
+	// cron reconcile picks the show up; say so instead of claiming it queued.
+	queued := h.enqueue(func() {
 		if err := h.reconcileShow(tvdbId); err != nil {
 			log.Printf("[webhook] reconcile tvdb=%d: %v", tvdbId, err)
 		}
@@ -217,34 +259,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]bool{"queued": true}) //nolint:errcheck
+	json.NewEncoder(w).Encode(map[string]bool{"queued": queued}) //nolint:errcheck
+}
+
+// payloadSeason returns the lowest requested season in the payload, or 0 when
+// the payload doesn't say. Checks the custom-template field request.season,
+// then Overseerr's default "extra" list ("Requested Seasons": "2, 3").
+func payloadSeason(p SeerrPayload) int {
+	if p.Request.Season > 0 {
+		return p.Request.Season
+	}
+	lowest := 0
+	for _, e := range p.Extra {
+		if !strings.Contains(strings.ToLower(e.Name), "season") {
+			continue
+		}
+		for _, part := range strings.FieldsFunc(e.Value, func(r rune) bool { return r == ',' || r == ' ' }) {
+			if n, err := strconv.Atoi(part); err == nil && n > 0 && (lowest == 0 || n < lowest) {
+				lowest = n
+			}
+		}
+	}
+	return lowest
+}
+
+// findRequest returns the stored request for this user and show, or nil.
+func (h *Handler) findRequest(tvdbId int, plexUserId string) *repository.UserRequest {
+	reqs, err := h.requests.FindByShow(tvdbId)
+	if err != nil {
+		return nil
+	}
+	for i := range reqs {
+		if reqs[i].PlexUserID == plexUserId {
+			return &reqs[i]
+		}
+	}
+	return nil
 }
 
 // resolvePlexUser attempts to map a username (or email) to a Plex account ID.
 // Tries username first, then email if provided. Falls back to "seerr:<username>"
 // when neither matches, deferring resolution to discoverNewWatchers.
 func (h *Handler) resolvePlexUser(username, email string) string {
-	userMap, err := h.plex.BuildUserMap()
-	if err != nil {
-		log.Printf("[webhook] build plex user map: %v", err)
-		return "seerr:" + username
-	}
-	if id, ok := userMap[username]; ok {
-		log.Printf("[webhook] resolved %q → accountId=%d (username match)", username, id)
-		return fmt.Sprintf("%d", id)
-	}
-	if email != "" {
-		if id, ok := userMap[email]; ok {
-			log.Printf("[webhook] resolved %q → accountId=%d (email match)", username, id)
-			return fmt.Sprintf("%d", id)
+	// Try the cached map first; on a miss, rebuild once in case the account
+	// was added to Plex since the cache was filled.
+	for _, load := range []func() (map[string]int, error){h.plex.BuildUserMap, h.plex.RefreshUserMap} {
+		userMap, err := load()
+		if err != nil {
+			log.Printf("[webhook] build plex user map: %v", err)
+			return "seerr:" + username
+		}
+		if id, ok := userMap[username]; ok {
+			log.Printf("[webhook] resolved %q → accountId=%d (username match)", username, id)
+			return strconv.Itoa(id)
+		}
+		if email != "" {
+			if id, ok := userMap[email]; ok {
+				log.Printf("[webhook] resolved %q → accountId=%d (email match)", username, id)
+				return strconv.Itoa(id)
+			}
 		}
 	}
 	log.Printf("[webhook] could not resolve %q (email=%q) — deferring to seerr:", username, email)
 	return "seerr:" + username
 }
 
-// upsertShow fetches the show from Sonarr and upserts it into the DB.
-func (h *Handler) upsertShow(tvdbId int) error {
+// upsertShow fetches the show from Sonarr and upserts it into the DB. manage
+// only applies when the row is first created.
+func (h *Handler) upsertShow(tvdbId int, manage bool) error {
 	series, err := h.sonarr.GetSeriesByTVDB(tvdbId)
 	if err != nil {
 		return fmt.Errorf("get series from sonarr: %w", err)
@@ -257,6 +339,7 @@ func (h *Handler) upsertShow(tvdbId int) error {
 		PosterURL: series.PosterURL(),
 		FanartURL: series.FanartURL(),
 		Status:    "active",
+		Unmanaged: !manage,
 	}
 	return h.shows.Upsert(show)
 }

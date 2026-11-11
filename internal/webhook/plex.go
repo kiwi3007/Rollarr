@@ -201,16 +201,22 @@ func (h *PlexHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.Unlock()
 
 	if !already {
-		h.enqueue(func() {
-			defer func() {
-				h.mu.Lock()
-				delete(h.pending, tvdbId)
-				h.mu.Unlock()
-			}()
+		clearPending := func() {
+			h.mu.Lock()
+			delete(h.pending, tvdbId)
+			h.mu.Unlock()
+		}
+		queued := h.enqueue(func() {
+			defer clearPending()
 			if err := h.reconcileShow(tvdbId); err != nil {
 				log.Printf("[plexhook] reconcile tvdb=%d: %v", tvdbId, err)
 			}
 		})
+		if !queued {
+			// The job will never run, so its deferred cleanup won't either.
+			// Without this, every later scrobble for the show is ignored.
+			clearPending()
+		}
 	}
 
 	w.WriteHeader(http.StatusAccepted)

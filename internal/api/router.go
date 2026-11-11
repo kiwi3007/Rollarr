@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"crypto/subtle"
 	"embed"
 	"io/fs"
@@ -45,6 +44,8 @@ func NewRouter(
 		r.Get("/api/shows", showsH.list)
 		r.Get("/api/shows/{tvdbId}", showsH.detail)
 		r.Post("/api/shows/{tvdbId}/reconcile", showsH.reconcile)
+		r.Put("/api/shows/{tvdbId}/managed", showsH.setManaged)
+		r.Get("/api/plex/users", showsH.plexUsers)
 
 		r.Get("/api/stats", func(w http.ResponseWriter, _ *http.Request) {
 			writeJSON(w, map[string]int64{
@@ -56,7 +57,6 @@ func NewRouter(
 		libH := &libraryHandler{shows: shows, requests: requests, events: events, engine: engine, sonarr: sonarrClient, plex: plexClient, reconciler: reconciler, queue: queue}
 		r.Get("/api/plex/library", libH.list)
 		r.Get("/api/plex/library/{tvdbId}/preview", libH.preview)
-		r.Get("/api/plex/users", libH.users)
 		r.Post("/api/shows", libH.addShow)
 
 		reqsH := &requestsHandler{requests: requests}
@@ -90,8 +90,13 @@ func NewRouter(
 		return r
 	}
 
+	// Unknown API paths get a real 404 instead of the SPA's index.html.
+	r.HandleFunc("/api/*", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	})
+
 	fileServer := http.FileServer(http.FS(distFS))
-	r.Get("/*", spaHandler(distFS, fileServer, token))
+	r.Get("/*", spaHandler(distFS, fileServer))
 
 	return r
 }
@@ -122,9 +127,9 @@ func bearerAuth(token string) func(http.Handler) http.Handler {
 }
 
 // spaHandler serves static files from distFS and falls back to index.html for
-// unmatched paths (React Router support). It also injects the API token into
-// index.html via the window.__ROLLARR_TOKEN__ sentinel.
-func spaHandler(distFS fs.FS, fileServer http.Handler, token string) http.HandlerFunc {
+// unmatched paths (React Router support). The SPA is public: it never carries
+// the API token, which the user enters once and the browser keeps.
+func spaHandler(distFS fs.FS, fileServer http.Handler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Check if the file exists in the dist FS.
 		cleanPath := strings.TrimPrefix(r.URL.Path, "/")
@@ -135,14 +140,14 @@ func spaHandler(distFS fs.FS, fileServer http.Handler, token string) http.Handle
 		f, err := distFS.Open(cleanPath)
 		if err != nil {
 			// File not found → serve index.html (SPA fallback).
-			serveIndexHTML(w, r, distFS, token)
+			serveIndexHTML(w, distFS)
 			return
 		}
 		f.Close()
 
-		// For index.html specifically, inject the token.
+		// index.html gets no-cache headers.
 		if cleanPath == "index.html" || r.URL.Path == "/" {
-			serveIndexHTML(w, r, distFS, token)
+			serveIndexHTML(w, distFS)
 			return
 		}
 
@@ -150,19 +155,16 @@ func spaHandler(distFS fs.FS, fileServer http.Handler, token string) http.Handle
 	}
 }
 
-// serveIndexHTML reads index.html, injects the API token, and writes the response.
-func serveIndexHTML(w http.ResponseWriter, _ *http.Request, distFS fs.FS, token string) {
+// serveIndexHTML writes index.html. It is served no-cache so a new build's
+// asset hashes are picked up immediately.
+func serveIndexHTML(w http.ResponseWriter, distFS fs.FS) {
 	content, err := fs.ReadFile(distFS, "index.html")
 	if err != nil {
 		http.Error(w, "frontend not found", http.StatusNotFound)
 		return
 	}
-
-	// Inject token as a script tag before </head>.
-	injection := `<script>window.__ROLLARR_TOKEN__ = "` + token + `";</script>`
-	content = bytes.Replace(content, []byte("</head>"), []byte(injection+"</head>"), 1)
-
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	w.Write(content) //nolint:errcheck
 }

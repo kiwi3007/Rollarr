@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Save, Loader2, CheckCircle, AlertCircle, Eye, EyeOff } from 'lucide-react';
 import { api } from '../api/client';
-import type { SettingsMap } from '../api/client';
+import type { SettingsMap, PlexUser } from '../api/client';
 
 const SECRET_SENTINEL = '***SET***';
 
@@ -59,6 +59,7 @@ export function Settings() {
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [revealed, setRevealed] = useState<Set<string>>(new Set());
+  const [plexUsers, setPlexUsers] = useState<PlexUser[] | null>(null);
 
   useEffect(() => {
     api.getSettings().then((data) => {
@@ -68,7 +69,18 @@ export function Settings() {
       setError(err instanceof Error ? err.message : 'Failed to load settings');
       setLoading(false);
     });
+    api.getPlexUsers().then(setPlexUsers).catch(() => setPlexUsers([]));
   }, []);
+
+  const excluded = new Set(
+    (values.excluded_user_ids ?? '').split(',').map((id) => id.trim()).filter(Boolean),
+  );
+
+  function toggleManaged(id: string) {
+    const next = new Set(excluded);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    setValues((v) => ({ ...v, excluded_user_ids: Array.from(next).join(',') }));
+  }
 
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
@@ -188,6 +200,32 @@ export function Settings() {
           </div>
         </div>
       ))}
+
+      <div className="settings-group">
+        <div className="settings-group-header">
+          <span className="section-title">Managed users</span>
+        </div>
+        <div style={{ padding: '16px 20px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ fontSize: '0.72rem', color: 'var(--color-text-muted)' }}>
+            Unticked users' Seerr requests download in full and are never pruned. They still get a buffer
+            window on shows a managed user requested. Shows already managed are not affected.
+          </div>
+          {plexUsers === null ? (
+            <Loader2 size={16} style={{ animation: 'spin 0.8s linear infinite', color: 'var(--color-text-muted)' }} />
+          ) : plexUsers.length === 0 ? (
+            <div style={{ fontSize: '0.82rem', color: 'var(--color-text-muted)' }}>
+              No Plex users found — check the Plex URL and token.
+            </div>
+          ) : (
+            plexUsers.map((u) => (
+              <label key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '0.875rem', color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
+                <input type="checkbox" checked={!excluded.has(u.id)} onChange={() => toggleManaged(u.id)} />
+                {u.name}
+              </label>
+            ))
+          )}
+        </div>
+      </div>
 
       {error && (
         <div style={{

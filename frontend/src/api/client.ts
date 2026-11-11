@@ -1,3 +1,5 @@
+import { getToken, signalUnauthorized } from '../auth';
+
 // Types
 export interface UserBufferInfo {
   display_name: string;
@@ -11,6 +13,7 @@ export interface ShowSummary {
   sonarr_id: number;
   title: string;
   status: 'active' | 'inactive' | 'removed';
+  managed: boolean;
   effective_buffer_size: number;
   active_request_count: number;
   last_activity_at: string | null;
@@ -60,6 +63,12 @@ export interface ShowDetail extends ShowSummary {
   events: ShowEvent[];
 }
 
+/** A Plex account, as returned by GET /api/plex/users. */
+export interface PlexUser {
+  id: string; // numeric Plex account ID as a string
+  name: string;
+}
+
 export type SettingsMap = Record<string, string>;
 
 export interface PlexLibraryShow {
@@ -100,10 +109,7 @@ export interface ShowPreview {
   bytes_freed: number;
 }
 
-export interface PlexUserOption {
-  id: number;
-  name: string;
-}
+export type PlexUserOption = PlexUser;
 
 export interface ManualUser {
   plex_user_id: string;
@@ -112,22 +118,32 @@ export interface ManualUser {
 }
 
 // API client
-const TOKEN = (window as any).__ROLLARR_TOKEN__ ?? '';
-
 async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
+  const token = getToken();
   const res = await fetch(path, {
     ...opts,
     headers: {
       'Content-Type': 'application/json',
-      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...opts?.headers,
     },
   });
+  if (res.status === 401) {
+    signalUnauthorized();
+    throw new Error('Not signed in');
+  }
   if (!res.ok) {
-    const body = (await res.text().catch(() => '')).trim();
-    throw new Error(body || `${res.status} ${res.statusText}`);
+    // Surface the server's message (e.g. settings validation errors).
+    const text = (await res.text().catch(() => '')).trim();
+    throw new Error(text || `${res.status} ${res.statusText}`);
   }
   return res.json();
+}
+
+/** Check a candidate token against the API without storing it. */
+export async function checkToken(token: string): Promise<boolean> {
+  const res = await fetch('/api/stats', { headers: { Authorization: `Bearer ${token}` } });
+  return res.ok;
 }
 
 export const api = {
@@ -136,6 +152,9 @@ export const api = {
   reconcileShow: (tvdbId: number) => apiFetch<{queued: boolean}>(`/api/shows/${tvdbId}/reconcile`, { method: 'POST' }),
   deleteRequest: (tvdbId: number, plexUserId: string) =>
     apiFetch<{ok: boolean}>(`/api/shows/${tvdbId}/requests/${encodeURIComponent(plexUserId)}`, { method: 'DELETE' }),
+  setManaged: (tvdbId: number, managed: boolean) =>
+    apiFetch<{ok: boolean; managed: boolean}>(`/api/shows/${tvdbId}/managed`, { method: 'PUT', body: JSON.stringify({ managed }) }),
+  getPlexUsers: () => apiFetch<PlexUser[]>('/api/plex/users'),
   getFlags: () => apiFetch<Flag[]>('/api/flags'),
   updateFlag: (id: number, status: 'resolved' | 'ignored') =>
     apiFetch<Flag>(`/api/flags/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),
@@ -155,7 +174,6 @@ export const api = {
     const qs = p.toString();
     return apiFetch<ShowPreview>(`/api/plex/library/${tvdbId}/preview${qs ? `?${qs}` : ''}`);
   },
-  getPlexUsers: () => apiFetch<PlexUserOption[]>('/api/plex/users'),
   addShow: (tvdbId: number, manualUser?: ManualUser) =>
     apiFetch<{queued: boolean}>('/api/shows', {
       method: 'POST',

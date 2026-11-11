@@ -167,12 +167,16 @@ func (h *libraryHandler) preview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// previewSavings counts the files the first reconcile would delete: every
-// episode with a file whose (season, episode) is outside the expected state —
-// the same orphan rule ReconcileShow applies (specials included).
+// previewSavings counts the files the first reconcile would delete and their
+// size, using reconcile's own file plan so the preview and the real reconcile
+// can't disagree (specials are kept; a multi-episode file counts once).
 func (h *libraryHandler) previewSavings(sonarrId int, expected state.ExpectedState) (int, int64) {
 	episodes, err := h.sonarr.GetEpisodes(sonarrId)
 	if err != nil {
+		return 0, 0
+	}
+	orphans := reconcile.OrphanFileIDs(episodes, expected)
+	if len(orphans) == 0 {
 		return 0, 0
 	}
 
@@ -184,38 +188,11 @@ func (h *libraryHandler) previewSavings(sonarrId int, expected state.ExpectedSta
 			sizeByFileID[f.ID] = f.Size
 		}
 	}
-
-	expectedSet := map[[2]int]bool{}
-	for season, eps := range expected {
-		for _, ep := range eps {
-			expectedSet[[2]int{season, ep}] = true
-		}
+	var bytes int64
+	for _, id := range orphans {
+		bytes += sizeByFileID[id]
 	}
-
-	files, bytes := 0, int64(0)
-	for _, ep := range episodes {
-		if !ep.HasFile || expectedSet[[2]int{ep.SeasonNumber, ep.EpisodeNumber}] {
-			continue
-		}
-		files++
-		bytes += sizeByFileID[ep.EpisodeFileId]
-	}
-	return files, bytes
-}
-
-// users handles GET /api/plex/users — the override dropdown source.
-func (h *libraryHandler) users(w http.ResponseWriter, _ *http.Request) {
-	type plexUserOption struct {
-		ID   int    `json:"id"`
-		Name string `json:"name"`
-	}
-	idToName := buildIDToNameMap(h.plex)
-	result := make([]plexUserOption, 0, len(idToName))
-	for id, name := range idToName {
-		result = append(result, plexUserOption{ID: id, Name: name})
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
-	writeJSON(w, result)
+	return len(orphans), bytes
 }
 
 // addShow handles POST /api/shows: manual onboarding from the library browser.
@@ -252,7 +229,7 @@ func (h *libraryHandler) addShow(w http.ResponseWriter, r *http.Request) {
 	}
 
 	manual := body.ManualUser
-	h.queue.Enqueue(func() {
+	queued := h.queue.Enqueue(func() {
 		show := repository.Show{
 			TVDBId:    tvdbId,
 			SonarrId:  series.ID,
@@ -304,6 +281,10 @@ func (h *libraryHandler) addShow(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
+	if !queued {
+		http.Error(w, "job queue full — try again shortly", http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	json.NewEncoder(w).Encode(map[string]bool{"queued": true}) //nolint:errcheck

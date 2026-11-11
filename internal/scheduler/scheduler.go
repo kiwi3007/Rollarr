@@ -8,7 +8,6 @@ import (
 	"github.com/robfig/cron/v3"
 )
 
-
 // JobQueue serialises all background jobs through a single goroutine to prevent
 // concurrent Sonarr/Plex races.
 type JobQueue struct {
@@ -21,9 +20,9 @@ func (q *JobQueue) SetNotify(fn func()) {
 	q.notifyFn = fn
 }
 
-// NewJobQueue constructs a JobQueue with a buffer of 64 pending jobs.
+// NewJobQueue constructs a JobQueue with a buffer of 256 pending jobs.
 func NewJobQueue() *JobQueue {
-	return &JobQueue{ch: make(chan func(), 64)}
+	return &JobQueue{ch: make(chan func(), 256)}
 }
 
 // Start launches the worker goroutine. Call this once at startup.
@@ -48,12 +47,15 @@ func (q *JobQueue) Start() {
 }
 
 // Enqueue adds a job to the queue. Non-blocking: if the queue is full the job
-// is dropped and a warning is logged.
-func (q *JobQueue) Enqueue(job func()) {
+// is dropped, a warning is logged and false is returned so callers can undo
+// any bookkeeping that assumed the job would run.
+func (q *JobQueue) Enqueue(job func()) bool {
 	select {
 	case q.ch <- job:
+		return true
 	default:
-		log.Printf("[scheduler] job queue full — dropping job")
+		log.Printf("[scheduler] job queue full (%d pending) — dropping job", cap(q.ch))
+		return false
 	}
 }
 
@@ -128,32 +130,12 @@ func (s *Scheduler) Stop() {
 	s.cron.Stop()
 }
 
-// minutesToCron converts a minute interval into a cron expression.
-// It snaps to the nearest valid cron stride (1, 2, 3, 5, 6, 10, 15, 20, 30).
+// minutesToCron converts a minute interval into a cron spec. "@every" runs at
+// exactly the configured interval; the old */N form had to snap to divisors
+// of 60 and truncated anything over an hour to whole hours (90 → 60).
 func minutesToCron(minutes int) string {
 	if minutes <= 0 {
 		minutes = 15
 	}
-	// For intervals >= 60, run hourly.
-	if minutes >= 60 {
-		hours := minutes / 60
-		return fmt.Sprintf("0 */%d * * *", hours)
-	}
-	// Snap to valid divisors of 60.
-	valid := []int{1, 2, 3, 5, 6, 10, 15, 20, 30}
-	snapped := valid[0]
-	for _, v := range valid {
-		if v <= minutes {
-			snapped = v
-		}
-	}
-	return fmt.Sprintf("*/%d * * * *", snapped)
-}
-
-// RunAt is a helper that schedules a one-shot job after a delay.
-func RunAt(delay time.Duration, job func()) {
-	go func() {
-		time.Sleep(delay)
-		job()
-	}()
+	return fmt.Sprintf("@every %dm", minutes)
 }

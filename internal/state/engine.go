@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
 	"github.com/kiwi3007/rollarr/internal/plex"
@@ -86,6 +87,21 @@ func (l *layout) positionIndex(season, episode int) int {
 	return i - 1
 }
 
+// finaleGrace is how long the last episode Sonarr knows is kept after a
+// watcher finishes it. Plex marks an episode watched at ~90% and the Plex
+// webhook reconciles within seconds, so without a grace period the finale was
+// deleted while the credits were still rolling. A week also covers a rewatch
+// of the ending. After the grace period the normal reconcile deletes it.
+const finaleGrace = 7 * 24 * time.Hour
+
+// keepFinale reports whether a finished watcher's last episode should still
+// be kept. viewedAt is when they watched it; zero means unknown (progress came
+// only from the stored floor, e.g. Plex was unreachable). Unknown is kept:
+// fail safe, and the inactivity prune still removes it eventually.
+func keepFinale(viewedAt, now time.Time) bool {
+	return viewedAt.IsZero() || now.Sub(viewedAt) < finaleGrace
+}
+
 // PlexClient is the subset of the Plex HTTP client the engine depends on.
 // Narrow interface so tests can substitute a fake.
 type PlexClient interface {
@@ -113,6 +129,7 @@ type Engine struct {
 	plex     PlexClient
 	plexdb   PlexDBReader // may be nil
 	sonarr   SonarrClient
+	now      func() time.Time // overridable in tests
 }
 
 // NewEngine constructs an Engine. plexDB may be nil if the Plex SQLite path is
@@ -130,6 +147,7 @@ func NewEngine(
 		plex:     plexClient,
 		plexdb:   plexDB,
 		sonarr:   sonarrClient,
+		now:      time.Now,
 	}
 }
 
@@ -199,7 +217,7 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 		showKey = ""
 	}
 
-	perUserHighest := e.gatherHighest(showKey, tvdbId, reqs)
+	perUserHighest, perUserViewed := e.gatherHighest(showKey, tvdbId, reqs)
 
 	if len(lay.linear) == 0 {
 		// Sonarr hasn't indexed any episodes yet (fresh series add).
@@ -207,7 +225,7 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 		return StateResult{Expected: ExpectedState{}, UserProgress: perUserHighest}, nil
 	}
 
-	result, _ := computeWindows(lay, reqs, perUserHighest, bufferSize, tvdbId)
+	result, _ := computeWindows(lay, reqs, perUserHighest, bufferSize, tvdbId, e.finalePolicy(perUserViewed))
 
 	log.Printf("[state] Compute tvdb=%d result: %v", tvdbId, result)
 	return StateResult{Expected: result, UserProgress: perUserHighest}, nil
@@ -215,13 +233,18 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 
 // gatherHighest fetches each request's Plex watch history (HTTP + plexdb),
 // merges it with the stored high-water mark, and reduces it to a per-user
-// season → highest-watched-episode map.
-func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.UserRequest) map[string]map[int]int {
+// season → highest-watched-episode map. It also returns each user's most
+// recent watch time per episode (used for the finale grace period).
+func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.UserRequest) (map[string]map[int]int, map[string]map[epRef]time.Time) {
 	// perUserHighest: userID → season → highestWatchedEpisode
 	perUserHighest := make(map[string]map[int]int)
+	// perUserViewed: userID → episode → most recent watch time (finale grace).
+	perUserViewed := make(map[string]map[epRef]time.Time)
 
 	for _, req := range reqs {
 		highest := make(map[int]int)
+		viewed := make(map[epRef]time.Time)
+		perUserViewed[req.PlexUserID] = viewed
 
 		if showKey != "" {
 			entries, err := e.fetchHistory(showKey, tvdbId, req)
@@ -235,6 +258,10 @@ func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.Use
 				}
 				if entry.EpisodeNum > highest[entry.SeasonNum] {
 					highest[entry.SeasonNum] = entry.EpisodeNum
+				}
+				ref := epRef{Season: entry.SeasonNum, Episode: entry.EpisodeNum}
+				if entry.ViewedAt.After(viewed[ref]) {
+					viewed[ref] = entry.ViewedAt
 				}
 			}
 		}
@@ -256,7 +283,20 @@ func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.Use
 		log.Printf("[state] tvdb=%d user=%s highest=%v", tvdbId, req.PlexUserID, highest)
 	}
 
-	return perUserHighest
+	return perUserHighest, perUserViewed
+}
+
+// finaleCheck reports whether a finished user's last watched episode should
+// still be kept.
+type finaleCheck func(user string, season, episode int) bool
+
+// finalePolicy keeps a finished user's last episode for finaleGrace after
+// they watched it (see keepFinale).
+func (e *Engine) finalePolicy(viewed map[string]map[epRef]time.Time) finaleCheck {
+	now := e.now()
+	return func(user string, season, episode int) bool {
+		return keepFinale(viewed[user][epRef{Season: season, Episode: episode}], now)
+	}
 }
 
 // userWindow is one user's buffer window as a closed range of linear indices
@@ -268,7 +308,10 @@ type userWindow struct {
 // computeWindows runs the window/anchor algorithm over a prepared layout and
 // per-user progress. It returns the expected episode set plus each user's
 // clamped window range (keyed by PlexUserID) for display purposes.
-func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest map[string]map[int]int, bufferSize int, tvdbId int) (ExpectedState, map[string]userWindow) {
+//
+// keepFinale decides whether a user who finished every known episode keeps
+// their last one; nil keeps nothing.
+func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest map[string]map[int]int, bufferSize int, tvdbId int, keepFinale finaleCheck) (ExpectedState, map[string]userWindow) {
 	include := make(map[epRef]struct{})
 	clamp := func(from, to int) (int, int) {
 		if from < 0 {
@@ -302,10 +345,19 @@ func computeWindows(lay *layout, reqs []repository.UserRequest, perUserHighest m
 			}
 			idx := lay.positionIndex(ps, pe)
 			if idx+1 >= len(lay.linear) {
-				// Finished every episode Sonarr knows — no window. The window
-				// revives automatically when new episodes appear in Sonarr.
-				log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — no window", tvdbId, req.PlexUserID, ps, pe)
-				windows[req.PlexUserID] = userWindow{from: -1, to: -1}
+				// Finished every episode Sonarr knows: no window ahead. The
+				// window revives automatically when new episodes appear in
+				// Sonarr. The finale itself is kept for finaleGrace after it
+				// was watched, then deleted by the normal reconcile.
+				if keepFinale != nil && keepFinale(req.PlexUserID, ps, pe) {
+					addRange(idx-safetyBehind+1, idx)
+					from, to := clamp(idx-safetyBehind+1, idx)
+					windows[req.PlexUserID] = userWindow{from: from, to: to}
+					log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — keeping finale (grace %s)", tvdbId, req.PlexUserID, ps, pe, finaleGrace)
+				} else {
+					windows[req.PlexUserID] = userWindow{from: -1, to: -1}
+					log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — no window", tvdbId, req.PlexUserID, ps, pe)
+				}
 				continue
 			}
 			addRange(idx-safetyBehind+1, idx+bufferSize)

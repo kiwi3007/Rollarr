@@ -7,6 +7,8 @@ import { FlagsPage } from './pages/FlagsPage';
 import { LibraryPage } from './pages/LibraryPage';
 import { Settings } from './pages/Settings';
 import { BackdropContext } from './context/BackdropContext';
+import { SignIn } from './components/SignIn';
+import { clearToken, UNAUTHORIZED_EVENT } from './auth';
 
 function bgFilter(isDark: boolean) {
   return isDark
@@ -32,10 +34,29 @@ function BackgroundArtwork({ isDark, url }: { isDark: boolean; url: string | nul
 export default function App() {
   const [isDark, setIsDark] = useState(true);
   const [backdropUrl, setBackdropUrl] = useState<string | null>(null);
+  const [needsSignIn, setNeedsSignIn] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle('light', !isDark);
   }, [isDark]);
+
+  useEffect(() => {
+    const onUnauthorized = () => {
+      clearToken();
+      setNeedsSignIn(true);
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
+
+  if (needsSignIn) {
+    return (
+      <>
+        <BackgroundArtwork isDark={isDark} url={null} />
+        <SignIn />
+      </>
+    );
+  }
 
   const navItems = [
     { to: '/',         icon: <LayoutGrid size={18} />,   label: 'Dashboard' },

@@ -8,15 +8,15 @@ import (
 
 // UserRequest mirrors a row from the user_requests table.
 type UserRequest struct {
-	ID                 int        `json:"id"`
-	PlexUserID         string     `json:"plex_user_id"`
-	DisplayName        string     `json:"display_name"`
-	TVDBId             int        `json:"tvdb_id"`
-	RequestTimestamp   time.Time  `json:"request_timestamp"`
-	IsRewatching       bool       `json:"is_rewatching"`
-	RequestedSeason    int        `json:"requested_season"`
-	LastWatchedSeason  *int       `json:"last_watched_season"`
-	LastWatchedEpisode *int       `json:"last_watched_episode"`
+	ID                 int       `json:"id"`
+	PlexUserID         string    `json:"plex_user_id"`
+	DisplayName        string    `json:"display_name"`
+	TVDBId             int       `json:"tvdb_id"`
+	RequestTimestamp   time.Time `json:"request_timestamp"`
+	IsRewatching       bool      `json:"is_rewatching"`
+	RequestedSeason    int       `json:"requested_season"`
+	LastWatchedSeason  *int      `json:"last_watched_season"`
+	LastWatchedEpisode *int      `json:"last_watched_episode"`
 }
 
 // UserRequestRepository provides access to the user_requests table.
@@ -126,20 +126,6 @@ func (r *UserRequestRepository) SetRequestedSeason(tvdbId, season int) error {
 	return nil
 }
 
-// DeleteSeerrRows removes all unresolved seerr:* rows for a show. Called after
-// discoverNewWatchers registers the real numeric account IDs, so the deferred
-// rows don't cause duplicate buffer windows.
-func (r *UserRequestRepository) DeleteSeerrRows(tvdbId int) error {
-	_, err := r.db.Exec(
-		`DELETE FROM user_requests WHERE tvdb_id = ? AND plex_user_id LIKE 'seerr:%'`,
-		tvdbId,
-	)
-	if err != nil {
-		return fmt.Errorf("user_requests.DeleteSeerrRows(%d): %w", tvdbId, err)
-	}
-	return nil
-}
-
 // Delete removes the user_request for the given (tvdb_id, plex_user_id) pair.
 func (r *UserRequestRepository) Delete(tvdbId int, plexUserId string) error {
 	_, err := r.db.Exec(
@@ -173,4 +159,31 @@ func (r *UserRequestRepository) SetRewatching(tvdbId int, plexUserId string, v b
 		return r.ClearWatchProgress(tvdbId, plexUserId)
 	}
 	return nil
+}
+
+// ShouldManage decides whether a show should be under Rollarr management given
+// its user_requests and the set of excluded Plex account IDs. It is evaluated
+// when a show is onboarded and when a new Seerr request arrives; it never
+// demotes an already-managed show.
+//
+// Policy:
+//   - Only Seerr-initiated rows (RequestedSeason >= 1) count. Auto-discovered
+//     watchers (RequestedSeason == 0) never switch management on.
+//   - Any Seerr row from a non-excluded user → managed.
+//   - No Seerr rows at all (webhook lost, show added directly in Sonarr) →
+//     managed, preserving pre-exclusion behaviour.
+//   - Unresolved "seerr:<username>" rows can't be matched to an account ID and
+//     count as non-excluded.
+func ShouldManage(reqs []UserRequest, excluded map[string]bool) bool {
+	seerrRequests := 0
+	for _, req := range reqs {
+		if req.RequestedSeason < 1 {
+			continue // auto-discovered watcher — never switches management on
+		}
+		seerrRequests++
+		if !excluded[req.PlexUserID] {
+			return true
+		}
+	}
+	return seerrRequests == 0
 }

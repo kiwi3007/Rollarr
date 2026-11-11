@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useContext, useMemo } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useSSE } from '../hooks/useSSE';
-import { ArrowLeft, Loader2, RefreshCw, Trash2 } from 'lucide-react';
+import { ArrowLeft, Loader2, RefreshCw, Trash2, ShieldCheck, ShieldOff } from 'lucide-react';
 import { api } from '../api/client';
 import type { ShowDetail as ShowDetailType, UserRequest, Flag, ShowEvent } from '../api/client';
 
@@ -12,8 +12,11 @@ const EVENT_COLORS: Record<string, string> = {
   onboarded:   'var(--color-accent-green)',
   reactivated: 'var(--color-accent-green)',
   pruned:      'var(--color-accent-amber)',
+  managed:     'var(--color-accent-green)',
+  unmanaged:   '#94a3b8',
 };
 import { WindowProgress, buildUserColorMap } from '../components/ShowCard';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { BackdropContext } from '../context/BackdropContext';
 
 const STATUS_BADGE: Record<string, { bg: string; border: string; color: string }> = {
@@ -39,6 +42,7 @@ export function ShowDetail() {
   const [error, setError] = useState<string | null>(null);
   const [reconciling, setReconciling] = useState(false);
   const [reconcileToast, setReconcileToast] = useState<string | null>(null);
+  const [confirmManage, setConfirmManage] = useState(false);
 
   const { setBackdrop } = useContext(BackdropContext);
 
@@ -74,6 +78,18 @@ export function ShowDetail() {
       setReconcileToast('Reconcile failed');
     }
     setTimeout(() => { setReconciling(false); setReconcileToast(null); }, 2500);
+  }
+
+  async function applyManaged(managed: boolean) {
+    setConfirmManage(false);
+    try {
+      await api.setManaged(tvdbIdNum, managed);
+      setReconcileToast(managed ? 'Now managed — reconcile queued' : 'Now unmanaged');
+    } catch {
+      setReconcileToast('Update failed');
+    }
+    load();
+    setTimeout(() => setReconcileToast(null), 2500);
   }
 
   async function handleDeleteRequest(req: UserRequest) {
@@ -114,6 +130,15 @@ export function ShowDetail() {
 
   return (
     <div className="page-enter" style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+      {confirmManage && (
+        <ConfirmDialog
+          title="Manage this show?"
+          message="Rollarr will reconcile it right away and delete every episode outside the current buffer windows."
+          confirmLabel="Manage show"
+          onConfirm={() => applyManaged(true)}
+          onCancel={() => setConfirmManage(false)}
+        />
+      )}
       {/* Hero header — fanart background if available */}
       <div style={{
         position: 'relative',
@@ -171,6 +196,15 @@ export function ShowDetail() {
                 }}>
                   {show.status}
                 </span>
+                {!show.managed && (
+                  <span style={{
+                    fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
+                    borderRadius: 'var(--radius-pill)',
+                    background: 'rgba(148,163,184,0.15)', border: '1px solid rgba(148,163,184,0.3)', color: '#94a3b8',
+                  }}>
+                    unmanaged
+                  </span>
+                )}
                 <span style={{
                   fontSize: '0.72rem', color: 'var(--color-text-muted)',
                   background: 'var(--color-glass-bg-light)', border: '1px solid var(--color-glass-border)',
@@ -219,6 +253,22 @@ export function ShowDetail() {
               >
                 <RefreshCw size={13} style={{ animation: reconciling ? 'spin 0.8s linear infinite' : 'none' }} />
                 Reconcile Now
+              </button>
+              <button
+                onClick={() => (show.managed ? applyManaged(false) : setConfirmManage(true))}
+                title={show.managed
+                  ? 'Stop managing: freeze files and monitoring as they are'
+                  : 'Start managing: prune to the buffer windows'}
+                style={{
+                  display: 'inline-flex', alignItems: 'center', gap: 6,
+                  padding: '0 14px', height: 32, borderRadius: 'var(--radius-pill)',
+                  border: '1px solid var(--color-glass-border)',
+                  background: 'var(--color-glass-bg)', cursor: 'pointer',
+                  color: 'var(--color-text-secondary)', fontSize: '0.8rem', fontWeight: 600,
+                }}
+              >
+                {show.managed ? <ShieldOff size={13} /> : <ShieldCheck size={13} />}
+                {show.managed ? 'Stop managing' : 'Manage show'}
               </button>
             </div>
           </div>

@@ -388,6 +388,20 @@ export function ShowCard({
               }}>
                 {show.status}
               </span>
+
+              {!show.managed && (
+                <span
+                  title="Requested by an excluded user — Rollarr tracks it but never deletes or searches"
+                  style={{
+                    fontSize: '0.68rem', fontWeight: 700, padding: '2px 8px',
+                    borderRadius: 'var(--radius-pill)',
+                    background: 'rgba(148,163,184,0.15)', border: '1px solid rgba(148,163,184,0.3)',
+                    color: '#94a3b8',
+                  }}
+                >
+                  unmanaged
+                </span>
+              )}
             </div>
           </div>
 

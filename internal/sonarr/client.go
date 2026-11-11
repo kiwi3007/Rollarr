@@ -53,13 +53,14 @@ func (s *Series) FanartURL() string {
 
 // Episode represents a Sonarr episode resource.
 type Episode struct {
-	ID            int  `json:"id"`
-	SeriesId      int  `json:"seriesId"`
-	SeasonNumber  int  `json:"seasonNumber"`
-	EpisodeNumber int  `json:"episodeNumber"`
-	HasFile       bool `json:"hasFile"`
-	EpisodeFileId int  `json:"episodeFileId"`
-	Monitored     bool `json:"monitored"`
+	ID            int        `json:"id"`
+	SeriesId      int        `json:"seriesId"`
+	SeasonNumber  int        `json:"seasonNumber"`
+	EpisodeNumber int        `json:"episodeNumber"`
+	HasFile       bool       `json:"hasFile"`
+	EpisodeFileId int        `json:"episodeFileId"`
+	Monitored     bool       `json:"monitored"`
+	AirDateUtc    *time.Time `json:"airDateUtc"` // nil when Sonarr has no air date (TBA)
 }
 
 // EpisodeFile represents a Sonarr episode file resource.
@@ -256,21 +257,6 @@ func (c *Client) GetEpisodeFiles(seriesId int) ([]EpisodeFile, error) {
 func (c *Client) DeleteEpisodeFile(fileId int) error {
 	path := fmt.Sprintf("/api/v3/episodefile/%d", fileId)
 	return c.delete(path)
-}
-
-// GetQueue returns the current Sonarr download queue.
-func (c *Client) GetQueue() ([]map[string]interface{}, error) {
-	// Sonarr wraps the queue in a paged response.
-	var wrapper struct {
-		Records []map[string]interface{} `json:"records"`
-	}
-	queueURL := "/api/v3/queue?" + url.Values{
-		"pageSize": {"1000"},
-	}.Encode()
-	if err := c.get(queueURL, &wrapper); err != nil {
-		return nil, err
-	}
-	return wrapper.Records, nil
 }
 
 // GetQueuedEpisodeIDs returns the set of episode IDs currently in the Sonarr

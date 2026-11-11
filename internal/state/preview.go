@@ -71,7 +71,7 @@ func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize
 
 	reqs := e.previewRequests(tvdbId, showKey, manual)
 
-	perUserHighest := e.gatherHighest(showKey, tvdbId, reqs)
+	perUserHighest, perUserViewed := e.gatherHighest(showKey, tvdbId, reqs)
 
 	allEpisodes := make(map[int][]int)
 	for _, ref := range lay.linear {
@@ -82,7 +82,7 @@ func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize
 		return PreviewResult{Expected: ExpectedState{}, AllEpisodes: allEpisodes}, nil
 	}
 
-	expected, windows := computeWindows(lay, reqs, perUserHighest, bufferSize, tvdbId)
+	expected, windows := computeWindows(lay, reqs, perUserHighest, bufferSize, tvdbId, e.finalePolicy(perUserViewed))
 
 	idToName := e.reverseUserMap()
 	watchers := make([]PreviewWatcher, 0, len(reqs))
