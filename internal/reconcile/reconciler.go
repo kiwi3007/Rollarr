@@ -294,17 +294,18 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		}
 	}
 
-	// 7. Monitor ALL expected episodes, then search newly-entering ones.
-	// Monitoring all expected each cycle ensures Sonarr state stays consistent
-	// even if an episode was manually unmonitored or the flag drifted.
-	var allExpectedIds []int
+	// 7. Monitor expected episodes that aren't, then search missing ones.
+	// Checked against this cycle's fresh Sonarr data, so a manual unmonitor
+	// or drifted flag is still corrected — without a PUT for every episode
+	// already monitored.
+	var toMonitor []int
 	for k, info := range episodesByKey {
-		if _, inExpected := expectedSet[k]; inExpected {
-			allExpectedIds = append(allExpectedIds, info.id)
+		if _, inExpected := expectedSet[k]; inExpected && !info.monitored {
+			toMonitor = append(toMonitor, info.id)
 		}
 	}
-	if len(allExpectedIds) > 0 {
-		if err := r.sonarr.MonitorEpisodes(allExpectedIds, true); err != nil {
+	if len(toMonitor) > 0 {
+		if err := r.sonarr.MonitorEpisodes(toMonitor, true); err != nil {
 			log.Printf("[reconcile] tvdb=%d monitor expected episodes: %v", tvdbId, err)
 		}
 	}

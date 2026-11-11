@@ -3,6 +3,7 @@ package scheduler
 import (
 	"fmt"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/robfig/cron/v3"
@@ -99,23 +100,13 @@ func (s *Scheduler) Start() error {
 	reconcileSpec := minutesToCron(reconcileMinutes)
 	inactivitySpec := minutesToCron(inactivityMinutes)
 
-	if _, err := s.cron.AddFunc(reconcileSpec, func() {
-		s.queue.Enqueue(func() {
-			if err := s.reconciler.ReconcileAll(); err != nil {
-				log.Printf("[scheduler] ReconcileAll error: %v", err)
-			}
-		})
-	}); err != nil {
+	reconcileAll := s.coalesced("ReconcileAll", s.reconciler.ReconcileAll)
+	if _, err := s.cron.AddFunc(reconcileSpec, reconcileAll); err != nil {
 		return fmt.Errorf("scheduler: add reconcile job: %w", err)
 	}
 
-	if _, err := s.cron.AddFunc(inactivitySpec, func() {
-		s.queue.Enqueue(func() {
-			if err := s.reconciler.PruneInactive(); err != nil {
-				log.Printf("[scheduler] PruneInactive error: %v", err)
-			}
-		})
-	}); err != nil {
+	pruneInactive := s.coalesced("PruneInactive", s.reconciler.PruneInactive)
+	if _, err := s.cron.AddFunc(inactivitySpec, pruneInactive); err != nil {
 		return fmt.Errorf("scheduler: add inactivity job: %w", err)
 	}
 
@@ -128,6 +119,29 @@ func (s *Scheduler) Start() error {
 // Stop gracefully shuts down the cron runner.
 func (s *Scheduler) Stop() {
 	s.cron.Stop()
+}
+
+// coalesced wraps a periodic job so at most one instance is queued or running.
+// When a full pass takes longer than its interval, cron would otherwise keep
+// queueing more full passes behind it, filling the queue and starving
+// webhook-triggered reconciles.
+func (s *Scheduler) coalesced(name string, job func() error) func() {
+	var pending atomic.Bool
+	return func() {
+		if !pending.CompareAndSwap(false, true) {
+			log.Printf("[scheduler] %s still queued or running — skipping this tick", name)
+			return
+		}
+		queued := s.queue.Enqueue(func() {
+			defer pending.Store(false)
+			if err := job(); err != nil {
+				log.Printf("[scheduler] %s error: %v", name, err)
+			}
+		})
+		if !queued {
+			pending.Store(false)
+		}
+	}
 }
 
 // minutesToCron converts a minute interval into a cron spec. "@every" runs at
