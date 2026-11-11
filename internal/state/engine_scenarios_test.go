@@ -165,8 +165,9 @@ func TestScenarioWindowCrossesSeasons(t *testing.T) {
 	expectState(t, eng, ExpectedState{1: {1, 9, 10}, 2: {1, 2}})
 }
 
-// Finished watcher holds no window — anchors only.
-func TestScenarioFinishedWatcher(t *testing.T) {
+// Finished watcher keeps the finale through the grace period — Plex marks it
+// watched at ~90%, so deleting immediately would cut off the credits.
+func TestScenarioFinishedWatcherKeepsFinale(t *testing.T) {
 	eng, requests := newTestEngine(t,
 		&fakeSonarr{episodes: eps(map[int]int{1: 10})},
 		&fakePlex{showKey: "555", history: map[int][]plex.WatchHistoryEntry{
@@ -175,7 +176,36 @@ func TestScenarioFinishedWatcher(t *testing.T) {
 	)
 	request(t, requests, "10", 1)
 
+	expectState(t, eng, ExpectedState{1: {1, 10}})
+}
+
+// Once the grace period has passed, the finale goes — anchors only.
+func TestScenarioFinishedWatcherFinaleGraceExpires(t *testing.T) {
+	eng, requests := newTestEngine(t,
+		&fakeSonarr{episodes: eps(map[int]int{1: 10})},
+		&fakePlex{showKey: "555", history: map[int][]plex.WatchHistoryEntry{
+			10: {watched(10, 1, 10, time.Now())},
+		}},
+	)
+	request(t, requests, "10", 1)
+	eng.now = func() time.Time { return time.Now().Add(finaleGrace + time.Hour) }
+
 	expectState(t, eng, ExpectedState{1: {1}})
+}
+
+// Progress known only from the stored floor (Plex unreachable) has no watch
+// time; the finale is kept rather than deleted on unknown state.
+func TestScenarioFinishedWatcherUnknownTimeKeepsFinale(t *testing.T) {
+	eng, requests := newTestEngine(t,
+		&fakeSonarr{episodes: eps(map[int]int{1: 10})},
+		&fakePlex{showKey: ""}, // show not found in Plex
+	)
+	request(t, requests, "10", 1)
+	if err := requests.UpdateWatchProgress(testTVDB, "10", 1, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	expectState(t, eng, ExpectedState{1: {1, 10}})
 }
 
 // Finished watcher's window revives when Sonarr learns a new season.
@@ -187,7 +217,7 @@ func TestScenarioFinishedWatcherRevives(t *testing.T) {
 		}},
 	)
 	request(t, requests, "10", 1)
-	expectState(t, eng, ExpectedState{1: {1}})
+	expectState(t, eng, ExpectedState{1: {1, 10}})
 
 	fs.episodes = eps(map[int]int{1: 10, 2: 8})
 	expectState(t, eng, ExpectedState{1: {1, 10}, 2: {1, 2, 3}})
@@ -199,7 +229,7 @@ func TestScenarioRewatchReseeds(t *testing.T) {
 	eng, requests := newTestEngine(t,
 		&fakeSonarr{episodes: eps(map[int]int{1: 10, 2: 10})},
 		&fakePlex{showKey: "555", history: map[int][]plex.WatchHistoryEntry{
-			10: {watched(10, 2, 10, time.Now().Add(-30 * 24 * time.Hour))}, // finished long ago
+			10: {watched(10, 2, 10, time.Now().Add(-30*24*time.Hour))}, // finished long ago
 		}},
 	)
 	request(t, requests, "10", 1)
@@ -263,7 +293,7 @@ func TestScenarioAutoDiscoveredKeepsHistory(t *testing.T) {
 	eng, requests := newTestEngine(t,
 		&fakeSonarr{episodes: eps(map[int]int{1: 10, 2: 10, 3: 10})},
 		&fakePlex{showKey: "555", history: map[int][]plex.WatchHistoryEntry{
-			10: {watched(10, 3, 2, time.Now().Add(-365 * 24 * time.Hour))}, // watched a year ago
+			10: {watched(10, 3, 2, time.Now().Add(-365*24*time.Hour))}, // watched a year ago
 		}},
 	)
 	err := requests.Upsert(repository.UserRequest{

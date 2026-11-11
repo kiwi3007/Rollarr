@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/kiwi3007/rollarr/internal/db/repository"
 	"github.com/kiwi3007/rollarr/internal/plex"
@@ -86,6 +87,21 @@ func (l *layout) positionIndex(season, episode int) int {
 	return i - 1
 }
 
+// finaleGrace is how long the last episode Sonarr knows is kept after a
+// watcher finishes it. Plex marks an episode watched at ~90% and the Plex
+// webhook reconciles within seconds, so without a grace period the finale was
+// deleted while the credits were still rolling. A week also covers a rewatch
+// of the ending. After the grace period the normal reconcile deletes it.
+const finaleGrace = 7 * 24 * time.Hour
+
+// keepFinale reports whether a finished watcher's last episode should still
+// be kept. viewedAt is when they watched it; zero means unknown (progress came
+// only from the stored floor, e.g. Plex was unreachable). Unknown is kept:
+// fail safe, and the inactivity prune still removes it eventually.
+func keepFinale(viewedAt, now time.Time) bool {
+	return viewedAt.IsZero() || now.Sub(viewedAt) < finaleGrace
+}
+
 // PlexClient is the subset of the Plex HTTP client the engine depends on.
 // Narrow interface so tests can substitute a fake.
 type PlexClient interface {
@@ -113,6 +129,7 @@ type Engine struct {
 	plex     PlexClient
 	plexdb   PlexDBReader // may be nil
 	sonarr   SonarrClient
+	now      func() time.Time // overridable in tests
 }
 
 // NewEngine constructs an Engine. plexDB may be nil if the Plex SQLite path is
@@ -130,6 +147,7 @@ func NewEngine(
 		plex:     plexClient,
 		plexdb:   plexDB,
 		sonarr:   sonarrClient,
+		now:      time.Now,
 	}
 }
 
@@ -201,9 +219,13 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 
 	// perUserHighest: userID → season → highestWatchedEpisode
 	perUserHighest := make(map[string]map[int]int)
+	// perUserViewed: userID → episode → most recent watch time (finale grace).
+	perUserViewed := make(map[string]map[epRef]time.Time)
 
 	for _, req := range reqs {
 		highest := make(map[int]int)
+		viewed := make(map[epRef]time.Time)
+		perUserViewed[req.PlexUserID] = viewed
 
 		if showKey != "" {
 			entries, err := e.fetchHistory(showKey, tvdbId, req)
@@ -217,6 +239,10 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 				}
 				if entry.EpisodeNum > highest[entry.SeasonNum] {
 					highest[entry.SeasonNum] = entry.EpisodeNum
+				}
+				ref := epRef{Season: entry.SeasonNum, Episode: entry.EpisodeNum}
+				if entry.ViewedAt.After(viewed[ref]) {
+					viewed[ref] = entry.ViewedAt
 				}
 			}
 		}
@@ -271,9 +297,17 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 			}
 			idx := lay.positionIndex(ps, pe)
 			if idx+1 >= len(lay.linear) {
-				// Finished every episode Sonarr knows — no window. The window
-				// revives automatically when new episodes appear in Sonarr.
-				log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — no window", tvdbId, req.PlexUserID, ps, pe)
+				// Finished every episode Sonarr knows: no window ahead. The
+				// window revives automatically when new episodes appear in
+				// Sonarr. The finale itself is kept for finaleGrace after it
+				// was watched, then deleted by the normal reconcile.
+				viewedAt := perUserViewed[req.PlexUserID][epRef{Season: ps, Episode: pe}]
+				if keepFinale(viewedAt, e.now()) {
+					addRange(idx-safetyBehind+1, idx)
+					log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — keeping finale (grace %s)", tvdbId, req.PlexUserID, ps, pe, finaleGrace)
+				} else {
+					log.Printf("[state] tvdb=%d user=%s finished at S%02dE%02d — finale grace expired, no window", tvdbId, req.PlexUserID, ps, pe)
+				}
 				continue
 			}
 			addRange(idx-safetyBehind+1, idx+bufferSize)
