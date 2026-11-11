@@ -3,6 +3,7 @@ package plex
 import (
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -262,8 +263,13 @@ func tvdbFromGuids(primary string, guids []string) int {
 	return 0
 }
 
+// ErrShowNotFound means Plex answered and the show is in no TV library —
+// distinct from Plex being unreachable, where watch history is unknown.
+var ErrShowNotFound = errors.New("show not found in Plex library")
+
 // FindShowByTVDB returns the Plex ratingKey of the show with the given TVDB
-// ID, or an error if it is not in any TV library.
+// ID. It wraps ErrShowNotFound when the show is in no TV library; any other
+// error means Plex couldn't be read.
 func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
 	c.libMu.Lock()
 	defer c.libMu.Unlock()
@@ -285,7 +291,7 @@ func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
 			return key, nil
 		}
 	}
-	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
+	return "", fmt.Errorf("plex: tvdbId=%d: %w", tvdbId, ErrShowNotFound)
 }
 
 // rebuildLibraryIndexLocked refreshes the tvdbId → ratingKey index.

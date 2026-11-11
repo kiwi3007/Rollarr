@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -213,11 +214,24 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 	// Find the Plex ratingKey for this show (needed to query history).
 	showKey, err := e.plex.FindShowByTVDB(tvdbId)
 	if err != nil {
-		// If the show isn't in Plex yet, we can only seed the premiere episodes.
+		if !errors.Is(err, plex.ErrShowNotFound) {
+			// Plex is unreachable: history is unknown, not empty. Stored
+			// progress can stand in for it, but a user without any would be
+			// re-seeded at their requested season and their current files
+			// would look like orphans. Fail rather than guess.
+			if u, ok := firstWithoutFloor(reqs); ok {
+				return StateResult{}, fmt.Errorf("state.Compute(%d): plex unavailable and user %s has no stored progress: %w", tvdbId, u, err)
+			}
+			log.Printf("[state] tvdb=%d: plex unavailable (%v) — using stored progress", tvdbId, err)
+		}
+		// Not in Plex (or unavailable with every floor known): no history.
 		showKey = ""
 	}
 
-	perUserHighest, perUserViewed := e.gatherHighest(showKey, tvdbId, reqs)
+	perUserHighest, perUserViewed, err := e.gatherHighest(showKey, tvdbId, reqs)
+	if err != nil {
+		return StateResult{}, fmt.Errorf("state.Compute(%d): %w", tvdbId, err)
+	}
 
 	if len(lay.linear) == 0 {
 		// Sonarr hasn't indexed any episodes yet (fresh series add).
@@ -235,7 +249,10 @@ func (e *Engine) Compute(tvdbId int) (StateResult, error) {
 // merges it with the stored high-water mark, and reduces it to a per-user
 // season → highest-watched-episode map. It also returns each user's most
 // recent watch time per episode (used for the finale grace period).
-func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.UserRequest) (map[string]map[int]int, map[string]map[epRef]time.Time) {
+//
+// A history fetch error is tolerated for a user with stored progress (the
+// floor stands in for it) and returned for a user without.
+func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.UserRequest) (map[string]map[int]int, map[string]map[epRef]time.Time, error) {
 	// perUserHighest: userID → season → highestWatchedEpisode
 	perUserHighest := make(map[string]map[int]int)
 	// perUserViewed: userID → episode → most recent watch time (finale grace).
@@ -249,7 +266,10 @@ func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.Use
 		if showKey != "" {
 			entries, err := e.fetchHistory(showKey, tvdbId, req)
 			if err != nil {
-				// Non-fatal: skip this user's history.
+				if !hasFloor(req) {
+					return nil, nil, fmt.Errorf("plex history for user %s unavailable and no stored progress: %w", req.PlexUserID, err)
+				}
+				log.Printf("[state] tvdb=%d user=%s: history unavailable (%v) — using stored progress", tvdbId, req.PlexUserID, err)
 				entries = nil
 			}
 			for _, entry := range entries {
@@ -283,7 +303,23 @@ func (e *Engine) gatherHighest(showKey string, tvdbId int, reqs []repository.Use
 		log.Printf("[state] tvdb=%d user=%s highest=%v", tvdbId, req.PlexUserID, highest)
 	}
 
-	return perUserHighest, perUserViewed
+	return perUserHighest, perUserViewed, nil
+}
+
+// hasFloor reports whether a request has stored watch progress.
+func hasFloor(req repository.UserRequest) bool {
+	return req.LastWatchedSeason != nil && req.LastWatchedEpisode != nil &&
+		*req.LastWatchedSeason > 0 && *req.LastWatchedEpisode > 0
+}
+
+// firstWithoutFloor returns the first request with no stored progress.
+func firstWithoutFloor(reqs []repository.UserRequest) (string, bool) {
+	for _, req := range reqs {
+		if !hasFloor(req) {
+			return req.PlexUserID, true
+		}
+	}
+	return "", false
 }
 
 // finaleCheck reports whether a finished user's last watched episode should

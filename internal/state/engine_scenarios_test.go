@@ -17,6 +17,7 @@ import (
 type fakePlex struct {
 	showKey string // "" = show not in Plex
 	findErr error
+	histErr error                            // returned by history calls (Plex failing mid-reconcile)
 	history map[int][]plex.WatchHistoryEntry // accountID → entries
 	userMap map[string]int
 }
@@ -26,12 +27,15 @@ func (f *fakePlex) FindShowByTVDB(int) (string, error) {
 		return "", f.findErr
 	}
 	if f.showKey == "" {
-		return "", fmt.Errorf("not in plex")
+		return "", fmt.Errorf("fake: %w", plex.ErrShowNotFound)
 	}
 	return f.showKey, nil
 }
 
 func (f *fakePlex) GetAccountHistory(_ string, accountId int) ([]plex.WatchHistoryEntry, error) {
+	if f.histErr != nil {
+		return nil, f.histErr
+	}
 	return f.history[accountId], nil
 }
 
@@ -271,6 +275,35 @@ func TestScenarioPlexDownUsesStoredFloor(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	expectState(t, eng, ExpectedState{1: {1, 5, 6, 7, 8}})
+}
+
+// Plex unreachable and a user has no stored progress (e.g. a rewatch just
+// reset it) → Compute fails rather than re-seeding them at their requested
+// season, which would make their current files look like orphans.
+func TestScenarioPlexDownWithoutFloorFailsSafe(t *testing.T) {
+	eng, requests := newTestEngine(t,
+		&fakeSonarr{episodes: eps(map[int]int{1: 10})},
+		&fakePlex{findErr: fmt.Errorf("plex down")},
+	)
+	request(t, requests, "10", 1)
+	if _, err := eng.Compute(testTVDB); err == nil {
+		t.Fatal("expected Compute to fail: plex down and no stored progress")
+	}
+}
+
+// History fetch failing mid-reconcile: a user with stored progress falls back
+// to it; a user without fails the computation.
+func TestScenarioHistoryErrorUsesFloorOrFails(t *testing.T) {
+	fp := &fakePlex{showKey: "555", histErr: fmt.Errorf("timeout")}
+	eng, requests := newTestEngine(t, &fakeSonarr{episodes: eps(map[int]int{1: 10})}, fp)
+	request(t, requests, "10", 1)
+	if _, err := eng.Compute(testTVDB); err == nil {
+		t.Fatal("expected Compute to fail without stored progress")
+	}
+	if err := requests.UpdateWatchProgress(testTVDB, "10", 1, 5); err != nil {
+		t.Fatal(err)
+	}
 	expectState(t, eng, ExpectedState{1: {1, 5, 6, 7, 8}})
 }
 
