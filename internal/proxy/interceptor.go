@@ -522,15 +522,25 @@ func (i *Interceptor) resolveEpisodes(episodeIds []int) (map[int]sonarr.Episode,
 	return result, nil
 }
 
-// getEpisodesByIDs fetches episode details for the given episode IDs.
-// It uses Sonarr's series episode list if a direct ID query is unavailable.
+// bulkEpisodeSource is implemented by sources that can fetch episodes by ID
+// in one call (Sonarr: GET /api/v3/episode?episodeIds=…).
+type bulkEpisodeSource interface {
+	GetEpisodesByIDs(ids []int) ([]sonarr.Episode, error)
+}
+
+// getEpisodesByIDs fetches episode details for the given episode IDs. It uses
+// the bulk endpoint when available. The fallback scans every series — one
+// request per series in Sonarr — so it only runs if the bulk call fails.
+// Best-effort: unresolved IDs pass through unfiltered.
 func (i *Interceptor) getEpisodesByIDs(episodeIds []int) ([]sonarr.Episode, error) {
-	// Sonarr v3 doesn't have a reliable bulk "get episodes by IDs" endpoint.
-	// The /episode endpoint requires a seriesId. Since we're intercepting a
-	// monitor/search request, we can infer the series by querying all series
-	// and checking which ones contain these episode IDs in their episode list.
-	//
-	// This is intentionally best-effort: if we can't resolve, we pass through.
+	if bulk, ok := i.sonarr.(bulkEpisodeSource); ok {
+		eps, err := bulk.GetEpisodesByIDs(episodeIds)
+		if err == nil {
+			return eps, nil
+		}
+		log.Printf("[proxy] bulk episode lookup failed, scanning all series: %v", err)
+	}
+
 	allSeries, err := i.sonarr.GetSeries()
 	if err != nil {
 		return nil, fmt.Errorf("getEpisodesByIDs: get all series: %w", err)
