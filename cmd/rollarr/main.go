@@ -1,18 +1,24 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	rollarr "github.com/kiwi3007/rollarr"
 	"github.com/kiwi3007/rollarr/internal/api"
 	"github.com/kiwi3007/rollarr/internal/config"
-	"github.com/kiwi3007/rollarr/internal/logbuf"
 	"github.com/kiwi3007/rollarr/internal/db"
 	"github.com/kiwi3007/rollarr/internal/db/repository"
+	"github.com/kiwi3007/rollarr/internal/logbuf"
 	"github.com/kiwi3007/rollarr/internal/plex"
 	"github.com/kiwi3007/rollarr/internal/proxy"
 	"github.com/kiwi3007/rollarr/internal/reconcile"
@@ -69,6 +75,7 @@ func main() {
 				log.Printf("warning: could not open Plex DB at %q: %v", resolvedPath, err)
 			} else {
 				log.Printf("Plex DB opened at %q", resolvedPath)
+				pd.SetOwnerIDResolver(plexClient.OwnerAccountID)
 				plexDB = pd
 				defer plexDB.Close()
 			}
@@ -226,10 +233,59 @@ func main() {
 	// Admin API + SPA.
 	r.Mount("/", apiRouter)
 
-	addr := ":" + cfg.Port
-	fmt.Fprintf(log.Writer(), "Rollarr starting on %s\n", addr)
-	if err := http.ListenAndServe(addr, r); err != nil {
-		log.Fatalf("listen: %v", err)
+	warnInsecureDefaults(apiToken, settings)
+
+	// Request contexts derive from baseCtx, which is cancelled at shutdown so
+	// long-lived SSE streams end instead of holding Shutdown open.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	defer cancelBase()
+	srv := &http.Server{
+		Addr:              ":" + cfg.Port,
+		Handler:           r,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		// No WriteTimeout: /api/events is a long-lived SSE stream.
+		BaseContext: func(net.Listener) context.Context { return baseCtx },
 	}
+
+	stop, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		fmt.Fprintf(log.Writer(), "Rollarr starting on %s\n", srv.Addr)
+		serveErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("listen: %v", err)
+		}
+	case <-stop.Done():
+		log.Printf("shutting down")
+		cancelBase()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("http shutdown: %v", err)
+		}
+	}
+	// Deferred cleanup (scheduler stop, Plex DB and database close) runs here;
+	// log.Fatalf would have skipped it.
 }
 
+// warnInsecureDefaults logs loudly when endpoints are open to anyone who can
+// reach the port. Each one can change what Rollarr deletes.
+func warnInsecureDefaults(apiToken string, settings *repository.SettingsRepository) {
+	if apiToken == "" {
+		log.Printf("WARNING: ROLLARR_API_TOKEN is not set — the admin API is unauthenticated")
+	}
+	if settings.Get("seerr_webhook_secret") == "" {
+		log.Printf("WARNING: seerr_webhook_secret is not set — anyone who can reach /webhooks/seerr can add requests")
+	}
+	if settings.Get("plex_webhook_secret") == "" {
+		log.Printf("WARNING: plex_webhook_secret is not set — /webhooks/plex accepts unauthenticated scrobbles")
+	}
+}

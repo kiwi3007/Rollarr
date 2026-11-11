@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 )
 
@@ -66,16 +67,16 @@ func migration0(tx *sql.Tx) error {
 
 	// Seed default settings — only insert rows that don't already exist.
 	defaults := map[string]string{
-		"global_buffer_size":            "3",
-		"global_inactivity_days":        "30",
-		"reconcile_interval_minutes":    "15",
-		"inactivity_interval_minutes":   "60",
-		"sonarr_url":                    "",
-		"sonarr_api_key":                "",
-		"plex_url":                      "",
-		"plex_token":                    "",
-		"plex_db_path":                  "",
-		"seerr_webhook_secret":          "",
+		"global_buffer_size":          "3",
+		"global_inactivity_days":      "30",
+		"reconcile_interval_minutes":  "15",
+		"inactivity_interval_minutes": "60",
+		"sonarr_url":                  "",
+		"sonarr_api_key":              "",
+		"plex_url":                    "",
+		"plex_token":                  "",
+		"plex_db_path":                "",
+		"seerr_webhook_secret":        "",
 	}
 
 	for k, v := range defaults {
@@ -224,8 +225,13 @@ func RunMigrations(db *sql.DB) error {
 	var currentVersion int
 	row := db.QueryRow(`SELECT COALESCE(CAST(value AS INTEGER), 0) FROM settings WHERE key = 'schema_version'`)
 	if err := row.Scan(&currentVersion); err != nil {
-		// No row — version is 0 (no migrations applied yet).
-		currentVersion = 0
+		if !errors.Is(err, sql.ErrNoRows) {
+			// Any other failure must stop startup: treating it as version 0
+			// would replay migration 1, which rebuilds user_requests and drops
+			// every column added after it.
+			return fmt.Errorf("read schema_version: %w", err)
+		}
+		currentVersion = 0 // fresh database
 	}
 
 	for i := currentVersion; i < len(migrations); i++ {

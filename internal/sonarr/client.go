@@ -248,21 +248,6 @@ func (c *Client) DeleteEpisodeFile(fileId int) error {
 	return c.delete(path)
 }
 
-// GetQueue returns the current Sonarr download queue.
-func (c *Client) GetQueue() ([]map[string]interface{}, error) {
-	// Sonarr wraps the queue in a paged response.
-	var wrapper struct {
-		Records []map[string]interface{} `json:"records"`
-	}
-	queueURL := "/api/v3/queue?" + url.Values{
-		"pageSize": {"1000"},
-	}.Encode()
-	if err := c.get(queueURL, &wrapper); err != nil {
-		return nil, err
-	}
-	return wrapper.Records, nil
-}
-
 // GetQueuedEpisodeIDs returns the set of episode IDs currently in the Sonarr
 // download queue (grabbed, downloading, or importing). Episodes in this set
 // should not be re-searched.
