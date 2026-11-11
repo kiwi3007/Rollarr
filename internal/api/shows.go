@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -269,7 +270,7 @@ func (h *showsHandler) reconcile(w http.ResponseWriter, r *http.Request) {
 
 	h.queue.Enqueue(func() {
 		if err := h.reconciler.ReconcileShow(tvdbId); err != nil {
-			_ = err
+			log.Printf("[api] manual reconcile tvdb=%d: %v", tvdbId, err)
 		}
 	})
 
@@ -315,7 +316,9 @@ func (h *showsHandler) setManaged(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Managed {
 		h.queue.Enqueue(func() {
-			_ = h.reconciler.ReconcileShow(tvdbId)
+			if err := h.reconciler.ReconcileShow(tvdbId); err != nil {
+				log.Printf("[api] reconcile after manage tvdb=%d: %v", tvdbId, err)
+			}
 		})
 	}
 	writeJSON(w, map[string]bool{"ok": true, "managed": body.Managed})

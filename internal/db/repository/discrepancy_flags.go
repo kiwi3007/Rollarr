@@ -8,13 +8,13 @@ import (
 
 // DiscrepancyFlag mirrors a row from the discrepancy_flags table.
 type DiscrepancyFlag struct {
-	ID               int
-	TVDBId           int
-	SonarrEpisodeId  *int
-	IssueDescription string
-	Status           string // open|resolved|ignored
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	ID               int       `json:"id"`
+	TVDBId           int       `json:"tvdb_id"`
+	SonarrEpisodeId  *int      `json:"sonarr_episode_id"`
+	IssueDescription string    `json:"issue_description"`
+	Status           string    `json:"status"` // open|resolved|ignored
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // DiscrepancyFlagRepository provides access to the discrepancy_flags table.

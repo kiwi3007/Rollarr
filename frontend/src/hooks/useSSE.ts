@@ -1,19 +1,20 @@
 import { useEffect, useRef } from 'react';
-
-const TOKEN = (window as any).__ROLLARR_TOKEN__ ?? '';
+import { getToken } from '../auth';
 
 export function useSSE(onRefresh: () => void): void {
   const onRefreshRef = useRef(onRefresh);
   onRefreshRef.current = onRefresh;
 
   useEffect(() => {
-    const url = TOKEN ? `/api/events?token=${encodeURIComponent(TOKEN)}` : '/api/events';
     let es: EventSource;
     let reconnectTimer: ReturnType<typeof setTimeout>;
     let active = true;
 
     function connect() {
       if (!active) return;
+      // Read the token on every connect so a sign-in takes effect on reconnect.
+      const token = getToken();
+      const url = token ? `/api/events?token=${encodeURIComponent(token)}` : '/api/events';
       es = new EventSource(url);
 
       es.onmessage = (e) => {
@@ -33,5 +34,5 @@ export function useSSE(onRefresh: () => void): void {
       clearTimeout(reconnectTimer);
       es?.close();
     };
-  }, []); // stable — url is module-level constant, callback accessed via ref
+  }, []); // stable — token read per connect, callback accessed via ref
 }

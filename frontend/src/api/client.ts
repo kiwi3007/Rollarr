@@ -1,3 +1,5 @@
+import { getToken, signalUnauthorized } from '../auth';
+
 // Types
 export interface UserBufferInfo {
   display_name: string;
@@ -69,19 +71,32 @@ export interface PlexUser {
 export type SettingsMap = Record<string, string>;
 
 // API client
-const TOKEN = (window as any).__ROLLARR_TOKEN__ ?? '';
-
 async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
+  const token = getToken();
   const res = await fetch(path, {
     ...opts,
     headers: {
       'Content-Type': 'application/json',
-      ...(TOKEN ? { Authorization: `Bearer ${TOKEN}` } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...opts?.headers,
     },
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (res.status === 401) {
+    signalUnauthorized();
+    throw new Error('Not signed in');
+  }
+  if (!res.ok) {
+    // Surface the server's message (e.g. settings validation errors).
+    const text = (await res.text().catch(() => '')).trim();
+    throw new Error(text || `${res.status} ${res.statusText}`);
+  }
   return res.json();
+}
+
+/** Check a candidate token against the API without storing it. */
+export async function checkToken(token: string): Promise<boolean> {
+  const res = await fetch('/api/stats', { headers: { Authorization: `Bearer ${token}` } });
+  return res.ok;
 }
 
 export const api = {
