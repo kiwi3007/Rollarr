@@ -288,11 +288,39 @@ func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
 	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
 }
 
-// rebuildLibraryIndexLocked scans all TV sections. It uses the JSON API for
-// section contents because only JSON includes the Guid array that modern Plex
-// agents (primary guid plex://show/…) store the tvdb:// ID in. A failed
-// section aborts the rebuild so a partial index never hides shows.
+// rebuildLibraryIndexLocked refreshes the tvdbId → ratingKey index.
 func (c *Client) rebuildLibraryIndexLocked(now time.Time) error {
+	shows, err := c.ListLibraryShows()
+	if err != nil {
+		return fmt.Errorf("plex library index: %w", err)
+	}
+	index := make(map[int]string, len(shows))
+	for _, show := range shows {
+		if show.TVDBId > 0 {
+			index[show.TVDBId] = show.RatingKey
+		}
+	}
+	c.libIndex = index
+	c.libBuilt = now
+	log.Printf("[plex] library index rebuilt: %d shows", len(index))
+	return nil
+}
+
+// LibraryShow is one TV show entry in the Plex library.
+type LibraryShow struct {
+	RatingKey string
+	Title     string
+	Year      int
+	TVDBId    int // 0 if the show has no TVDB GUID
+}
+
+// ListLibraryShows returns every show across all TV library sections with its
+// TVDB ID resolved from either the legacy or modern agent GUID. It uses the
+// JSON API for section contents because only JSON includes the Guid array
+// that modern Plex agents (primary guid plex://show/…) store tvdb:// in. A
+// failed section fails the whole call: a partial list would make shows look
+// absent from Plex.
+func (c *Client) ListLibraryShows() ([]LibraryShow, error) {
 	var sections struct {
 		XMLName xml.Name `xml:"MediaContainer"`
 		Dirs    []struct {
@@ -301,10 +329,10 @@ func (c *Client) rebuildLibraryIndexLocked(now time.Time) error {
 		} `xml:"Directory"`
 	}
 	if err := c.getXML("/library/sections", &sections); err != nil {
-		return fmt.Errorf("plex library index: get sections: %w", err)
+		return nil, fmt.Errorf("plex.ListLibraryShows: get sections: %w", err)
 	}
 
-	index := make(map[int]string)
+	var result []LibraryShow
 	for _, sec := range sections.Dirs {
 		if sec.Type != "show" {
 			continue
@@ -315,6 +343,8 @@ func (c *Client) rebuildLibraryIndexLocked(now time.Time) error {
 			MediaContainer struct {
 				Metadata []struct {
 					RatingKey string `json:"ratingKey"`
+					Title     string `json:"title"`
+					Year      int    `json:"year"`
 					GUID      string `json:"guid"`
 					Guid      []struct {
 						ID string `json:"id"`
@@ -323,22 +353,22 @@ func (c *Client) rebuildLibraryIndexLocked(now time.Time) error {
 			} `json:"MediaContainer"`
 		}
 		if err := c.getJSON("/library/sections/"+url.PathEscape(sec.Key)+"/all?type=2&includeGuids=1", &resp); err != nil {
-			return fmt.Errorf("plex library index: section %s: %w", sec.Key, err)
+			return nil, fmt.Errorf("plex.ListLibraryShows: section %s: %w", sec.Key, err)
 		}
 		for _, show := range resp.MediaContainer.Metadata {
 			guids := make([]string, 0, len(show.Guid))
 			for _, g := range show.Guid {
 				guids = append(guids, g.ID)
 			}
-			if id := tvdbFromGuids(show.GUID, guids); id > 0 {
-				index[id] = show.RatingKey
-			}
+			result = append(result, LibraryShow{
+				RatingKey: show.RatingKey,
+				Title:     show.Title,
+				Year:      show.Year,
+				TVDBId:    tvdbFromGuids(show.GUID, guids),
+			})
 		}
 	}
-	c.libIndex = index
-	c.libBuilt = now
-	log.Printf("[plex] library index rebuilt: %d shows", len(index))
-	return nil
+	return result, nil
 }
 
 // GetShowTVDBID resolves a show's Plex ratingKey to its TVDB ID by reading the
@@ -373,6 +403,25 @@ func (c *Client) GetShowTVDBID(ratingKey string) (int, error) {
 		return id, nil
 	}
 	return 0, fmt.Errorf("plex.GetShowTVDBID(%s): no tvdb guid", ratingKey)
+}
+
+// GetMachineIdentifier returns the local server's machineIdentifier — the
+// stable UUID Plex also reports as Server.uuid in webhook payloads. Used to
+// tell scrobbles that happened on this server apart from scrobbles the account
+// generated on somebody else's server.
+func (c *Client) GetMachineIdentifier() (string, error) {
+	var resp struct {
+		MediaContainer struct {
+			MachineIdentifier string `json:"machineIdentifier"`
+		} `json:"MediaContainer"`
+	}
+	if err := c.getJSON("/", &resp); err != nil {
+		return "", fmt.Errorf("plex.GetMachineIdentifier: %w", err)
+	}
+	if resp.MediaContainer.MachineIdentifier == "" {
+		return "", fmt.Errorf("plex.GetMachineIdentifier: empty identifier")
+	}
+	return resp.MediaContainer.MachineIdentifier, nil
 }
 
 // Ping checks that the server is reachable and the token is accepted. It hits

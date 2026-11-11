@@ -324,19 +324,19 @@ func (h *showsHandler) setManaged(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]bool{"ok": true, "managed": body.Managed})
 }
 
-// plexUsers handles GET /api/plex/users — the Plex accounts available for the
-// managed-users setting.
+// plexUsers handles GET /api/plex/users — the Plex accounts for the
+// excluded-users setting and the library page's watcher override.
 func (h *showsHandler) plexUsers(w http.ResponseWriter, _ *http.Request) {
 	type plexUser struct {
-		ID       string `json:"id"`
-		Username string `json:"username"`
+		ID   string `json:"id"` // numeric account ID as a string
+		Name string `json:"name"`
 	}
 	users := []plexUser{}
 	for id, name := range buildIDToNameMap(h.plex) {
-		users = append(users, plexUser{ID: strconv.Itoa(id), Username: name})
+		users = append(users, plexUser{ID: strconv.Itoa(id), Name: name})
 	}
 	sort.Slice(users, func(i, j int) bool {
-		return strings.ToLower(users[i].Username) < strings.ToLower(users[j].Username)
+		return strings.ToLower(users[i].Name) < strings.ToLower(users[j].Name)
 	})
 	writeJSON(w, users)
 }

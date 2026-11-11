@@ -23,8 +23,9 @@ type PlexHandler struct {
 	enqueue       EnqueueFunc
 	reconcileShow func(tvdbId int) error
 
-	mu      sync.Mutex
-	pending map[int]bool // tvdbIds with a reconcile already queued (scrobble-burst dedupe)
+	mu        sync.Mutex
+	pending   map[int]bool // tvdbIds with a reconcile already queued (scrobble-burst dedupe)
+	machineID string       // cached local PMS machineIdentifier ("" = not yet fetched)
 }
 
 // NewPlexHandler constructs a PlexHandler.
@@ -47,7 +48,17 @@ func NewPlexHandler(
 
 // plexPayload is the subset of the Plex webhook JSON payload we care about.
 type plexPayload struct {
-	Event    string `json:"event"`
+	Event string `json:"event"`
+	// Owner is true when the webhook fired because the account owns the
+	// server the playback happened on; User is true when it fired because the
+	// playback was the account's own (which happens on *any* server it can
+	// reach, including servers other people own).
+	Owner  bool `json:"owner"`
+	User   bool `json:"user"`
+	Server struct {
+		Title string `json:"title"`
+		UUID  string `json:"uuid"` // == the server's machineIdentifier
+	} `json:"Server"`
 	Metadata struct {
 		Type                 string `json:"type"` // "episode"
 		GrandparentRatingKey string `json:"grandparentRatingKey"`
@@ -55,6 +66,54 @@ type plexPayload struct {
 		ParentIndex          int    `json:"parentIndex"` // season
 		Index                int    `json:"index"`       // episode
 	} `json:"Metadata"`
+}
+
+// localMachineID returns this PMS's machineIdentifier, fetched once and cached
+// for the process lifetime (it never changes for a given server). A failed
+// lookup is not cached, so a Plex restart mid-boot doesn't poison the value.
+func (h *PlexHandler) localMachineID() (string, error) {
+	h.mu.Lock()
+	cached := h.machineID
+	h.mu.Unlock()
+	if cached != "" {
+		return cached, nil
+	}
+
+	id, err := h.plex.GetMachineIdentifier()
+	if err != nil {
+		return "", err
+	}
+
+	h.mu.Lock()
+	h.machineID = id
+	h.mu.Unlock()
+	return id, nil
+}
+
+// isLocalPlayback decides whether a scrobble happened on *this* Plex server and
+// should therefore be allowed to drive downloads.
+//
+// This matters because Plex delivers webhooks per-account: a Plex Home user (or
+// the account itself) watching on a friend's server fires the exact same
+// media.scrobble at us. Acting on those is actively harmful — grandparentRatingKey
+// is a server-local database ID, so a foreign key dereferenced against our PMS
+// resolves to an unrelated show, and ServeHTTP will happily reactivate a pruned
+// show and search for it.
+//
+// The check is deliberately server-scoped, not account-scoped: any user playing
+// on this server carries our machineIdentifier in Server.uuid, so shared and
+// managed users still drive their own windows. Only the *server* is filtered.
+//
+// localID is this server's machineIdentifier, or "" if it could not be fetched.
+// Either side being empty means provenance is unknown, and unknown fails safe:
+// a dropped scrobble only delays the window until the next cron sweep, which
+// rebuilds it from local history anyway, whereas a wrongly accepted one deletes
+// and downloads against the wrong show.
+func isLocalPlayback(payload plexPayload, localID string) bool {
+	if localID == "" || payload.Server.UUID == "" {
+		return false
+	}
+	return payload.Server.UUID == localID
 }
 
 // ServeHTTP handles POST /webhooks/plex.
@@ -89,6 +148,20 @@ func (h *PlexHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if payload.Metadata.GrandparentRatingKey == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	// Provenance check *before* the ratingKey is dereferenced: keys from a
+	// foreign server are meaningless here and can resolve to the wrong show.
+	localID, err := h.localMachineID()
+	if err != nil {
+		log.Printf("[plexhook] cannot resolve local machineIdentifier: %v", err)
+	}
+	if !isLocalPlayback(payload, localID) {
+		log.Printf("[plexhook] ignoring scrobble %q S%02dE%02d from server %q (%s) — not this server",
+			payload.Metadata.GrandparentTitle, payload.Metadata.ParentIndex, payload.Metadata.Index,
+			payload.Server.Title, payload.Server.UUID)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}

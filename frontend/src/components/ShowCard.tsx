@@ -208,7 +208,7 @@ function posterInitials(title: string): string {
   return title.split(' ').filter(Boolean).slice(0, 2).map((w) => w[0].toUpperCase()).join('');
 }
 
-function ShowPoster({ title, posterUrl }: { title: string; posterUrl?: string }) {
+export function ShowPoster({ title, posterUrl }: { title: string; posterUrl?: string }) {
   const [loaded, setLoaded] = useState(false);
   const [errored, setErrored] = useState(false);
   return (

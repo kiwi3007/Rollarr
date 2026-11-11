@@ -63,12 +63,59 @@ export interface ShowDetail extends ShowSummary {
   events: ShowEvent[];
 }
 
+/** A Plex account, as returned by GET /api/plex/users. */
 export interface PlexUser {
-  id: string;
-  username: string;
+  id: string; // numeric Plex account ID as a string
+  name: string;
 }
 
 export type SettingsMap = Record<string, string>;
+
+export interface PlexLibraryShow {
+  tvdb_id: number;
+  title: string;
+  year: number;
+  plex_key: string;
+  poster_url: string;
+  in_sonarr: boolean;
+  sonarr_id: number;
+  is_tracked: boolean;
+}
+
+export interface WindowSegment {
+  season: number;
+  start: number;
+  end: number;
+}
+
+export interface PreviewWatcher {
+  plex_user_id: string;
+  display_name: string;
+  detected: boolean;
+  is_rewatching: boolean;
+  highest_season: number;
+  highest_episode: number;
+  segments: WindowSegment[];
+}
+
+export interface ShowPreview {
+  tvdb_id: number;
+  title: string;
+  buffer_size: number;
+  expected_state: Record<number, number[]>;
+  all_episodes: Record<number, number[]>;
+  watchers: PreviewWatcher[];
+  files_deleted: number;
+  bytes_freed: number;
+}
+
+export type PlexUserOption = PlexUser;
+
+export interface ManualUser {
+  plex_user_id: string;
+  display_name: string;
+  requested_season: number;
+}
 
 // API client
 async function apiFetch<T>(path: string, opts?: RequestInit): Promise<T> {
@@ -112,6 +159,26 @@ export const api = {
   updateFlag: (id: number, status: 'resolved' | 'ignored') =>
     apiFetch<Flag>(`/api/flags/${id}`, { method: 'PUT', body: JSON.stringify({ status }) }),
   getStats: () => apiFetch<Stats>('/api/stats'),
+  getLibrary: () => apiFetch<PlexLibraryShow[]>('/api/plex/library'),
+  getShowPreview: (
+    tvdbId: number,
+    opts?: { key?: string; override?: { user: string; name: string; season: number } },
+  ) => {
+    const p = new URLSearchParams();
+    if (opts?.key) p.set('key', opts.key);
+    if (opts?.override) {
+      p.set('user', opts.override.user);
+      p.set('name', opts.override.name);
+      p.set('season', String(opts.override.season));
+    }
+    const qs = p.toString();
+    return apiFetch<ShowPreview>(`/api/plex/library/${tvdbId}/preview${qs ? `?${qs}` : ''}`);
+  },
+  addShow: (tvdbId: number, manualUser?: ManualUser) =>
+    apiFetch<{queued: boolean}>('/api/shows', {
+      method: 'POST',
+      body: JSON.stringify({ tvdb_id: tvdbId, ...(manualUser ? { manual_user: manualUser } : {}) }),
+    }),
   getSettings: () => apiFetch<SettingsMap>('/api/settings'),
   saveSettings: (s: SettingsMap) => apiFetch<SettingsMap>('/api/settings', { method: 'PUT', body: JSON.stringify(s) }),
 };

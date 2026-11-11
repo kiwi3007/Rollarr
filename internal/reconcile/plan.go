@@ -4,6 +4,7 @@ import (
 	"sort"
 
 	"github.com/kiwi3007/rollarr/internal/sonarr"
+	"github.com/kiwi3007/rollarr/internal/state"
 )
 
 // epKey identifies one episode as (season, episode).
@@ -67,6 +68,24 @@ func planOrphans(episodes []sonarr.Episode, expected map[epKey]struct{}) []orpha
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].fileId < out[j].fileId })
 	return out
+}
+
+// OrphanFileIDs returns the episode file IDs a reconcile would delete for the
+// given expected state. Exposed so previews report exactly what reconcile
+// does (specials kept, a multi-episode file counted once).
+func OrphanFileIDs(episodes []sonarr.Episode, expected state.ExpectedState) []int {
+	set := make(map[epKey]struct{})
+	for season, eps := range expected {
+		for _, ep := range eps {
+			set[epKey{season, ep}] = struct{}{}
+		}
+	}
+	orphans := planOrphans(episodes, set)
+	ids := make([]int, len(orphans))
+	for i, o := range orphans {
+		ids[i] = o.fileId
+	}
+	return ids
 }
 
 // planUnmonitor returns managed episodes that are outside every window and

@@ -220,7 +220,7 @@ export function Settings() {
             plexUsers.map((u) => (
               <label key={u.id} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: '0.875rem', color: 'var(--color-text-secondary)', cursor: 'pointer' }}>
                 <input type="checkbox" checked={!excluded.has(u.id)} onChange={() => toggleManaged(u.id)} />
-                {u.username}
+                {u.name}
               </label>
             ))
           )}
