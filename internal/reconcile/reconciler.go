@@ -167,7 +167,9 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		return nil
 	}
 
-	// 1a. Auto-discover watchers who started playing without a Seerr request.
+	// 1a. Convert placeholder requests whose user now resolves, then
+	// auto-discover watchers who started playing without a Seerr request.
+	r.resolveSeerrRows(tvdbId)
 	if showKey, err := r.plex.FindShowByTVDB(tvdbId); err == nil {
 		r.discoverNewWatchers(show, showKey)
 	}
@@ -215,8 +217,6 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	}
 
 	// 3. Build maps: expected set and actual-with-file set.
-	// expectedSet: (season, episode) → episodeId
-	type epKey struct{ season, episode int }
 	expectedSet := make(map[epKey]struct{})
 	for season, eps := range expected {
 		for _, ep := range eps {
@@ -268,40 +268,26 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 		}
 	}
 
-	// 5. Compute orphaned: has file but not expected.
-	type orphan struct {
-		fileId, season, episode int
-	}
-	var orphans []orphan
-	for k, info := range actualWithFile {
-		if _, inExpected := expectedSet[k]; !inExpected {
-			if info.fileId > 0 {
-				orphans = append(orphans, orphan{info.fileId, k.season, k.episode})
-			}
-		}
-	}
-
-	// 5b. Build the unmonitor list — applied AFTER file deletes (step 6) because
-	// Sonarr silently sets an episode back to monitored=true when its file is
-	// deleted via the API (to allow re-download). Unmonitoring before the delete
-	// would be immediately undone by Sonarr.
-	var toUnmonitor []int
-	for k, info := range episodesByKey {
-		if _, inExpected := expectedSet[k]; !inExpected {
-			toUnmonitor = append(toUnmonitor, info.id)
-		}
-	}
+	// 5. Compute orphaned files: no episode in the file is expected. Specials
+	// and multi-episode files are handled by planOrphans.
+	orphans := planOrphans(episodes, expectedSet)
 
 	// 6. Delete orphaned files.
+	deleted := make(map[int]bool, len(orphans))
 	for _, o := range orphans {
-		if err := r.deleteFileTracked(tvdbId, o.fileId, o.season, o.episode, "outside all user windows"); err != nil {
+		first := o.eps[0]
+		if err := r.deleteFileTracked(tvdbId, o.fileId, first.season, first.episode, "outside all user windows"); err != nil {
 			log.Printf("[reconcile] tvdb=%d delete file %d: %v", tvdbId, o.fileId, err)
 		} else {
-			log.Printf("[reconcile] tvdb=%d deleted orphaned file %d (S%02dE%02d)", tvdbId, o.fileId, o.season, o.episode)
+			deleted[o.fileId] = true
+			log.Printf("[reconcile] tvdb=%d deleted orphaned file %d (%d episode(s) from S%02dE%02d)", tvdbId, o.fileId, len(o.eps), first.season, first.episode)
 		}
 	}
 
-	// 6b. Unmonitor out-of-window episodes now that deletes are done.
+	// 6b. Unmonitor out-of-window episodes — AFTER file deletes, because Sonarr
+	// silently sets an episode back to monitored=true when its file is deleted
+	// via the API. Unmonitoring first would be immediately undone.
+	toUnmonitor := planUnmonitor(episodes, expectedSet, deleted)
 	if len(toUnmonitor) > 0 {
 		if err := r.sonarr.MonitorEpisodes(toUnmonitor, false); err != nil {
 			log.Printf("[reconcile] tvdb=%d unmonitor out-of-window: %v", tvdbId, err)
@@ -394,6 +380,15 @@ func (r *Reconciler) PruneInactive() error {
 	// against the old inactivity clock below.
 	r.ReviveInactive()
 
+	// Fail safe: last_activity_at only advances while Plex answers. During a
+	// Plex outage (or with an expired token) every show's clock would keep
+	// running and shows being watched would be pruned one by one. Unknown
+	// activity must never be read as no activity.
+	if err := r.plex.Ping(); err != nil {
+		log.Printf("[reconcile] prune skipped: Plex unreachable, watch activity unknown: %v", err)
+		return nil
+	}
+
 	shows, err := r.shows.FindByStatus("active")
 	if err != nil {
 		return fmt.Errorf("prune inactive: find active shows: %w", err)
@@ -447,15 +442,20 @@ func (r *Reconciler) PruneInactive() error {
 		// would strand the files forever.
 
 		var allIds []int
-		deleted := 0
+		deleted, failed := 0, 0
+		seenFiles := make(map[int]bool)
 		for _, ep := range episodes {
 			allIds = append(allIds, ep.ID)
-			if ep.HasFile && ep.EpisodeFileId > 0 {
-				if err := r.deleteFileTracked(show.TVDBId, ep.EpisodeFileId, ep.SeasonNumber, ep.EpisodeNumber, "inactivity prune"); err != nil {
-					log.Printf("[reconcile] delete file %d for show %d: %v", ep.EpisodeFileId, show.TVDBId, err)
-				} else {
-					deleted++
-				}
+			// A multi-episode file appears once per episode; delete it once.
+			if !ep.HasFile || ep.EpisodeFileId <= 0 || seenFiles[ep.EpisodeFileId] {
+				continue
+			}
+			seenFiles[ep.EpisodeFileId] = true
+			if err := r.deleteFileTracked(show.TVDBId, ep.EpisodeFileId, ep.SeasonNumber, ep.EpisodeNumber, "inactivity prune"); err != nil {
+				log.Printf("[reconcile] delete file %d for show %d: %v", ep.EpisodeFileId, show.TVDBId, err)
+				failed++
+			} else {
+				deleted++
 			}
 		}
 
@@ -463,6 +463,13 @@ func (r *Reconciler) PruneInactive() error {
 			if err := r.sonarr.MonitorEpisodes(allIds, false); err != nil {
 				log.Printf("[reconcile] unmonitor all for show %d: %v", show.TVDBId, err)
 			}
+		}
+
+		// Leave the show active while any file survived, so the next prune
+		// pass retries instead of stranding it as inactive with files on disk.
+		if failed > 0 {
+			log.Printf("[reconcile] show %d: %d file delete(s) failed — staying active, will retry next run", show.TVDBId, failed)
+			continue
 		}
 
 		// A watcher who caught up is waiting for new episodes, not gone: arm
@@ -558,14 +565,82 @@ func (r *Reconciler) discoverNewWatchers(show *repository.Show, showKey string) 
 			r.logEvent(show.TVDBId, "discovered", fmt.Sprintf("registered watcher accountId=%d from Plex history", accountID))
 		}
 	}
+}
 
-	// Drop unresolved seerr: rows whenever numeric accounts exist for this show —
-	// numeric rows are the resolved form; seerr: rows are deferred placeholders.
-	if len(seenAccountIDs) > 0 {
-		if err := r.requests.DeleteSeerrRows(show.TVDBId); err != nil {
-			log.Printf("[reconcile] discoverNewWatchers tvdb=%d: delete seerr rows: %v", show.TVDBId, err)
+// resolveSeerrRows converts "seerr:<username>" placeholder requests into
+// numeric-account requests once that username resolves in Plex. Only the
+// placeholder's own user is converted: the old approach deleted every
+// placeholder as soon as anyone had history for the show, silently dropping
+// other users' requests.
+func (r *Reconciler) resolveSeerrRows(tvdbId int) {
+	reqs, err := r.requests.FindByShow(tvdbId)
+	if err != nil {
+		log.Printf("[reconcile] resolveSeerrRows tvdb=%d: load requests: %v", tvdbId, err)
+		return
+	}
+	hasPlaceholder := false
+	for _, req := range reqs {
+		if strings.HasPrefix(req.PlexUserID, "seerr:") {
+			hasPlaceholder = true
+			break
 		}
 	}
+	if !hasPlaceholder {
+		return
+	}
+	userMap, err := r.plex.BuildUserMap()
+	if err != nil {
+		log.Printf("[reconcile] resolveSeerrRows tvdb=%d: plex users: %v", tvdbId, err)
+		return
+	}
+
+	upserts, deletes := planSeerrResolution(reqs, userMap)
+	for _, u := range upserts {
+		if err := r.requests.Upsert(u); err != nil {
+			log.Printf("[reconcile] resolveSeerrRows tvdb=%d: upsert %s: %v", tvdbId, u.PlexUserID, err)
+			return // keep the placeholder; retry next cycle
+		}
+	}
+	for _, id := range deletes {
+		if err := r.requests.Delete(tvdbId, id); err != nil {
+			log.Printf("[reconcile] resolveSeerrRows tvdb=%d: delete %s: %v", tvdbId, id, err)
+			continue
+		}
+		log.Printf("[reconcile] resolveSeerrRows tvdb=%d: resolved %s", tvdbId, id)
+	}
+}
+
+// planSeerrResolution decides, for each resolvable placeholder, which numeric
+// row to write and which placeholder to delete. An existing Seerr-initiated
+// numeric row (RequestedSeason >= 1) for the same account wins; an
+// auto-discovered one (RequestedSeason 0) is upgraded with the request's
+// season, timestamp and rewatch flag, because the user did request it.
+func planSeerrResolution(reqs []repository.UserRequest, userMap map[string]int) (upserts []repository.UserRequest, deletes []string) {
+	numeric := make(map[string]repository.UserRequest)
+	for _, req := range reqs {
+		if !strings.HasPrefix(req.PlexUserID, "seerr:") {
+			numeric[req.PlexUserID] = req
+		}
+	}
+	for _, req := range reqs {
+		username, ok := strings.CutPrefix(req.PlexUserID, "seerr:")
+		if !ok {
+			continue
+		}
+		accountID, ok := userMap[username]
+		if !ok || accountID <= 0 {
+			continue // still unresolved — keep the placeholder
+		}
+		id := strconv.Itoa(accountID)
+		if existing, ok := numeric[id]; !ok || existing.RequestedSeason < 1 {
+			resolved := req
+			resolved.PlexUserID = id
+			upserts = append(upserts, resolved)
+			numeric[id] = resolved
+		}
+		deletes = append(deletes, req.PlexUserID)
+	}
+	return upserts, deletes
 }
 
 // updateLastActivity fetches the most recent Plex watch event for the show —

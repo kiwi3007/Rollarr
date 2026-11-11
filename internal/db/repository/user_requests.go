@@ -8,15 +8,15 @@ import (
 
 // UserRequest mirrors a row from the user_requests table.
 type UserRequest struct {
-	ID                 int        `json:"id"`
-	PlexUserID         string     `json:"plex_user_id"`
-	DisplayName        string     `json:"display_name"`
-	TVDBId             int        `json:"tvdb_id"`
-	RequestTimestamp   time.Time  `json:"request_timestamp"`
-	IsRewatching       bool       `json:"is_rewatching"`
-	RequestedSeason    int        `json:"requested_season"`
-	LastWatchedSeason  *int       `json:"last_watched_season"`
-	LastWatchedEpisode *int       `json:"last_watched_episode"`
+	ID                 int       `json:"id"`
+	PlexUserID         string    `json:"plex_user_id"`
+	DisplayName        string    `json:"display_name"`
+	TVDBId             int       `json:"tvdb_id"`
+	RequestTimestamp   time.Time `json:"request_timestamp"`
+	IsRewatching       bool      `json:"is_rewatching"`
+	RequestedSeason    int       `json:"requested_season"`
+	LastWatchedSeason  *int      `json:"last_watched_season"`
+	LastWatchedEpisode *int      `json:"last_watched_episode"`
 }
 
 // UserRequestRepository provides access to the user_requests table.
@@ -122,20 +122,6 @@ func (r *UserRequestRepository) SetRequestedSeason(tvdbId, season int) error {
 	)
 	if err != nil {
 		return fmt.Errorf("user_requests.SetRequestedSeason(%d, %d): %w", tvdbId, season, err)
-	}
-	return nil
-}
-
-// DeleteSeerrRows removes all unresolved seerr:* rows for a show. Called after
-// discoverNewWatchers registers the real numeric account IDs, so the deferred
-// rows don't cause duplicate buffer windows.
-func (r *UserRequestRepository) DeleteSeerrRows(tvdbId int) error {
-	_, err := r.db.Exec(
-		`DELETE FROM user_requests WHERE tvdb_id = ? AND plex_user_id LIKE 'seerr:%'`,
-		tvdbId,
-	)
-	if err != nil {
-		return fmt.Errorf("user_requests.DeleteSeerrRows(%d): %w", tvdbId, err)
 	}
 	return nil
 }
