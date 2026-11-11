@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,12 +19,20 @@ type Client struct {
 	BaseURL string
 	Token   string
 	http    *http.Client
+
+	libMu    sync.Mutex
+	libIndex map[int]string // tvdbId → ratingKey
+	libBuilt time.Time
+
+	usersMu    sync.Mutex
+	users      map[string]int
+	usersBuilt time.Time
 }
 
 // WatchHistoryEntry is a single entry from the Plex watch history.
 type WatchHistoryEntry struct {
 	AccountID  int
-	EpisodeKey string    // e.g. /library/metadata/12345
+	EpisodeKey string // e.g. /library/metadata/12345
 	ViewedAt   time.Time
 	SeasonNum  int
 	EpisodeNum int
@@ -45,13 +54,11 @@ func NewClient(baseURL, token string) *Client {
 	}
 }
 
-// addToken appends the Plex authentication token as a query parameter.
-func (c *Client) addToken(rawURL string) string {
-	sep := "?"
-	if strings.Contains(rawURL, "?") {
-		sep = "&"
-	}
-	return rawURL + sep + "X-Plex-Token=" + url.QueryEscape(c.Token)
+// authorize sets the Plex token as a header. It must never go in the URL:
+// Go's transport errors embed the full request URL, and those errors are
+// logged and served by /api/logs.
+func (c *Client) authorize(req *http.Request) {
+	req.Header.Set("X-Plex-Token", c.Token)
 }
 
 // getJSON performs a GET request and JSON-decodes the response body into out.
@@ -60,10 +67,11 @@ func (c *Client) getJSON(path string, out interface{}) error {
 	log.Printf("[plex] GET %s (json)", path)
 
 	fullURL := c.BaseURL + path
-	req, err := http.NewRequest(http.MethodGet, c.addToken(fullURL), nil)
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
 	if err != nil {
 		return fmt.Errorf("plex GET %s: build request: %w", path, err)
 	}
+	c.authorize(req)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -87,10 +95,11 @@ func (c *Client) getXML(path string, out interface{}) error {
 	log.Printf("[plex] GET %s", path)
 
 	fullURL := c.BaseURL + path
-	req, err := http.NewRequest(http.MethodGet, c.addToken(fullURL), nil)
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
 	if err != nil {
 		return fmt.Errorf("plex GET %s: build request: %w", path, err)
 	}
+	c.authorize(req)
 	req.Header.Set("Accept", "application/xml")
 
 	resp, err := c.http.Do(req)
@@ -121,12 +130,12 @@ type mediaContainer struct {
 }
 
 type video struct {
-	Key           string `xml:"key,attr"`
+	Key            string `xml:"key,attr"`
 	GrandparentKey string `xml:"grandparentKey,attr"`
-	ParentIndex   string `xml:"parentIndex,attr"`   // season number
-	Index         string `xml:"index,attr"`         // episode number
-	AccountID     string `xml:"accountID,attr"`
-	ViewedAt      string `xml:"viewedAt,attr"` // unix timestamp
+	ParentIndex    string `xml:"parentIndex,attr"` // season number
+	Index          string `xml:"index,attr"`       // episode number
+	AccountID      string `xml:"accountID,attr"`
+	ViewedAt       string `xml:"viewedAt,attr"` // unix timestamp
 }
 
 // ---- Plex users XML types --------------------------------------------------
@@ -139,7 +148,7 @@ type mediaContainerUsers struct {
 
 // mediaContainerAccounts parses local /accounts responses (<Account> elements).
 type mediaContainerAccounts struct {
-	XMLName  xml.Name     `xml:"MediaContainer"`
+	XMLName  xml.Name      `xml:"MediaContainer"`
 	Accounts []plexAccount `xml:"Account"`
 }
 
@@ -224,21 +233,66 @@ func parseHistory(videos []video) ([]WatchHistoryEntry, error) {
 	return entries, nil
 }
 
-// FindShowByTVDB searches the Plex library for a show matching the given TVDB
-// ID and returns its ratingKey, or an error if not found.
-// Falls through to a full section scan that checks both legacy and modern GUIDs.
-func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
-	return c.findShowByTVDBFallback(tvdbId)
+// Library index caching. FindShowByTVDB used to download every show in every
+// TV section on each call, several times per show per reconcile. The index
+// maps tvdbId → ratingKey for the whole library and is rebuilt when stale, or
+// on a miss (a show just added to Plex) at most once per libraryMissRescan.
+const (
+	libraryIndexTTL   = 30 * time.Minute
+	libraryMissRescan = 2 * time.Minute
+)
+
+// tvdbFromGuids extracts the TVDB ID from a Plex item's Guid array (modern
+// agent, "tvdb://121361") or primary guid (legacy agent,
+// "com.plexapp.agents.thetvdb://121361?lang=en"). Returns 0 when absent.
+func tvdbFromGuids(primary string, guids []string) int {
+	for _, g := range guids {
+		if rest, ok := strings.CutPrefix(g, "tvdb://"); ok {
+			if id, err := strconv.Atoi(rest); err == nil && id > 0 {
+				return id
+			}
+		}
+	}
+	if rest, ok := strings.CutPrefix(primary, "com.plexapp.agents.thetvdb://"); ok {
+		rest, _, _ = strings.Cut(rest, "?")
+		if id, err := strconv.Atoi(rest); err == nil && id > 0 {
+			return id
+		}
+	}
+	return 0
 }
 
-// findShowByTVDBFallback scans all TV library sections using the JSON API so
-// that both legacy (com.plexapp.agents.thetvdb) and modern (tvdb://) GUIDs
-// are checked. Modern Plex agents use plex://show/ as the primary guid and
-// store tvdb://XXXXX in the Guid array — only the JSON response includes that
-// array (XML only has the primary guid attribute).
-func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
-	// Use XML for sections list (known to work); JSON for individual section
-	// content so we get the Guid array needed to detect modern Plex agent shows.
+// FindShowByTVDB returns the Plex ratingKey of the show with the given TVDB
+// ID, or an error if it is not in any TV library.
+func (c *Client) FindShowByTVDB(tvdbId int) (string, error) {
+	c.libMu.Lock()
+	defer c.libMu.Unlock()
+
+	now := time.Now()
+	if c.libIndex == nil || now.Sub(c.libBuilt) > libraryIndexTTL {
+		if err := c.rebuildLibraryIndexLocked(now); err != nil {
+			return "", err
+		}
+	}
+	if key, ok := c.libIndex[tvdbId]; ok {
+		return key, nil
+	}
+	if now.Sub(c.libBuilt) > libraryMissRescan {
+		if err := c.rebuildLibraryIndexLocked(now); err != nil {
+			return "", err
+		}
+		if key, ok := c.libIndex[tvdbId]; ok {
+			return key, nil
+		}
+	}
+	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
+}
+
+// rebuildLibraryIndexLocked scans all TV sections. It uses the JSON API for
+// section contents because only JSON includes the Guid array that modern Plex
+// agents (primary guid plex://show/…) store the tvdb:// ID in. A failed
+// section aborts the rebuild so a partial index never hides shows.
+func (c *Client) rebuildLibraryIndexLocked(now time.Time) error {
 	var sections struct {
 		XMLName xml.Name `xml:"MediaContainer"`
 		Dirs    []struct {
@@ -247,49 +301,44 @@ func (c *Client) findShowByTVDBFallback(tvdbId int) (string, error) {
 		} `xml:"Directory"`
 	}
 	if err := c.getXML("/library/sections", &sections); err != nil {
-		return "", fmt.Errorf("plex.FindShowByTVDB: get sections: %w", err)
+		return fmt.Errorf("plex library index: get sections: %w", err)
 	}
 
-	modernGUID := fmt.Sprintf("tvdb://%d", tvdbId)
-	legacyGUID := fmt.Sprintf("com.plexapp.agents.thetvdb://%d", tvdbId)
-
-	type jsonGuid struct {
-		ID string `json:"id"`
-	}
-	type jsonShow struct {
-		RatingKey string     `json:"ratingKey"`
-		Title     string     `json:"title"`
-		GUID      string     `json:"guid"`
-		Guid      []jsonGuid `json:"Guid"`
-	}
-	var showsResp struct {
-		MediaContainer struct {
-			Metadata []jsonShow `json:"Metadata"`
-		} `json:"MediaContainer"`
-	}
-
+	index := make(map[int]string)
 	for _, sec := range sections.Dirs {
 		if sec.Type != "show" {
 			continue
 		}
-		if err := c.getJSON("/library/sections/"+sec.Key+"/all?type=2&includeGuids=1", &showsResp); err != nil {
-			continue
+		// Declared per section: decoding into a reused struct keeps stale
+		// Guid entries from the previous section's slice elements.
+		var resp struct {
+			MediaContainer struct {
+				Metadata []struct {
+					RatingKey string `json:"ratingKey"`
+					GUID      string `json:"guid"`
+					Guid      []struct {
+						ID string `json:"id"`
+					} `json:"Guid"`
+				} `json:"Metadata"`
+			} `json:"MediaContainer"`
 		}
-		for _, show := range showsResp.MediaContainer.Metadata {
-			if strings.Contains(show.GUID, legacyGUID) {
-				log.Printf("[plex] FindShowByTVDB tvdb=%d → %q (legacy GUID)", tvdbId, show.Title)
-				return show.RatingKey, nil
-			}
+		if err := c.getJSON("/library/sections/"+url.PathEscape(sec.Key)+"/all?type=2&includeGuids=1", &resp); err != nil {
+			return fmt.Errorf("plex library index: section %s: %w", sec.Key, err)
+		}
+		for _, show := range resp.MediaContainer.Metadata {
+			guids := make([]string, 0, len(show.Guid))
 			for _, g := range show.Guid {
-				if g.ID == modernGUID {
-					log.Printf("[plex] FindShowByTVDB tvdb=%d → %q (modern GUID)", tvdbId, show.Title)
-					return show.RatingKey, nil
-				}
+				guids = append(guids, g.ID)
+			}
+			if id := tvdbFromGuids(show.GUID, guids); id > 0 {
+				index[id] = show.RatingKey
 			}
 		}
 	}
-
-	return "", fmt.Errorf("plex: show with tvdbId=%d not found in library", tvdbId)
+	c.libIndex = index
+	c.libBuilt = now
+	log.Printf("[plex] library index rebuilt: %d shows", len(index))
+	return nil
 }
 
 // GetShowTVDBID resolves a show's Plex ratingKey to its TVDB ID by reading the
@@ -316,42 +365,58 @@ func (c *Client) GetShowTVDBID(ratingKey string) (int, error) {
 	}
 
 	md := resp.MediaContainer.Metadata[0]
+	guids := make([]string, 0, len(md.Guid))
 	for _, g := range md.Guid {
-		if rest, ok := strings.CutPrefix(g.ID, "tvdb://"); ok {
-			if id, err := strconv.Atoi(rest); err == nil && id > 0 {
-				return id, nil
-			}
-		}
+		guids = append(guids, g.ID)
 	}
-	// Legacy agent: com.plexapp.agents.thetvdb://121361?lang=en
-	if rest, ok := strings.CutPrefix(md.GUID, "com.plexapp.agents.thetvdb://"); ok {
-		rest, _, _ = strings.Cut(rest, "?")
-		if id, err := strconv.Atoi(rest); err == nil && id > 0 {
-			return id, nil
-		}
+	if id := tvdbFromGuids(md.GUID, guids); id > 0 {
+		return id, nil
 	}
 	return 0, fmt.Errorf("plex.GetShowTVDBID(%s): no tvdb guid", ratingKey)
 }
 
-// GetUsers returns all Plex managed/home users visible to the local server.
-func (c *Client) GetUsers() ([]PlexUser, error) {
-	var mc mediaContainerAccounts
-	if err := c.getXML("/accounts", &mc); err != nil {
-		return nil, fmt.Errorf("plex.GetUsers: %w", err)
+// Ping checks that the server is reachable and the token is accepted. It hits
+// an authenticated endpoint on purpose: /identity answers without a token, so
+// it would report healthy with an expired one.
+func (c *Client) Ping() error {
+	var mc struct {
+		XMLName xml.Name `xml:"MediaContainer"`
 	}
+	if err := c.getXML("/library/sections", &mc); err != nil {
+		return fmt.Errorf("plex.Ping: %w", err)
+	}
+	return nil
+}
 
-	users := make([]PlexUser, 0, len(mc.Accounts))
-	for _, u := range mc.Accounts {
-		id, _ := strconv.Atoi(u.ID)
-		if id == 0 {
-			continue
-		}
-		users = append(users, PlexUser{
-			ID:       id,
-			Username: u.Name,
-		})
+// OwnerAccountID returns the plex.tv account ID of the token's owner (the
+// server owner, in a normal setup).
+func (c *Client) OwnerAccountID() (int, error) {
+	req, err := http.NewRequest(http.MethodGet, "https://plex.tv/users/account", nil)
+	if err != nil {
+		return 0, fmt.Errorf("plex.OwnerAccountID: build request: %w", err)
 	}
-	return users, nil
+	c.authorize(req)
+	req.Header.Set("Accept", "application/xml")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("plex.OwnerAccountID: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, fmt.Errorf("plex.OwnerAccountID: status %d", resp.StatusCode)
+	}
+	var user struct {
+		XMLName xml.Name `xml:"user"`
+		ID      string   `xml:"id,attr"`
+	}
+	if err := xml.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return 0, fmt.Errorf("plex.OwnerAccountID: decode: %w", err)
+	}
+	id, err := strconv.Atoi(user.ID)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("plex.OwnerAccountID: bad id %q", user.ID)
+	}
+	return id, nil
 }
 
 // GetPlexTVUsers fetches friend/shared-library users from the plex.tv cloud
@@ -361,11 +426,11 @@ func (c *Client) GetUsers() ([]PlexUser, error) {
 func (c *Client) GetPlexTVUsers() ([]PlexUser, error) {
 	var mc mediaContainerUsers
 	// plex.tv cloud endpoint — absolute URL, not relative to BaseURL.
-	fullURL := "https://plex.tv/api/users?X-Plex-Token=" + url.QueryEscape(c.Token)
-	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	req, err := http.NewRequest(http.MethodGet, "https://plex.tv/api/users", nil)
 	if err != nil {
 		return nil, fmt.Errorf("plex.GetPlexTVUsers: build request: %w", err)
 	}
+	c.authorize(req)
 	req.Header.Set("Accept", "application/xml")
 
 	resp, err := c.http.Do(req)
@@ -403,7 +468,38 @@ func (c *Client) GetPlexTVUsers() ([]PlexUser, error) {
 // non-home accounts resolve correctly. Both display name and login name are
 // indexed. A cloud lookup failure is non-fatal — local accounts are always
 // returned.
+//
+// The result is cached for userMapTTL: the dashboard, the state engine and
+// webhooks all call this, and each build is two HTTP requests, one of them to
+// plex.tv. Callers that just failed to resolve a name use RefreshUserMap.
 func (c *Client) BuildUserMap() (map[string]int, error) {
+	c.usersMu.Lock()
+	defer c.usersMu.Unlock()
+	if c.users != nil && time.Since(c.usersBuilt) < userMapTTL {
+		return copyUserMap(c.users), nil
+	}
+	return c.buildUserMapLocked()
+}
+
+// RefreshUserMap rebuilds the user map, bypassing the cache. Used when a
+// lookup misses, e.g. a friend added to Plex since the last build.
+func (c *Client) RefreshUserMap() (map[string]int, error) {
+	c.usersMu.Lock()
+	defer c.usersMu.Unlock()
+	return c.buildUserMapLocked()
+}
+
+const userMapTTL = 10 * time.Minute
+
+func copyUserMap(m map[string]int) map[string]int {
+	out := make(map[string]int, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func (c *Client) buildUserMapLocked() (map[string]int, error) {
 	var mc mediaContainerAccounts
 	if err := c.getXML("/accounts", &mc); err != nil {
 		return nil, fmt.Errorf("plex.BuildUserMap: %w", err)
@@ -435,5 +531,11 @@ func (c *Client) BuildUserMap() (map[string]int, error) {
 		}
 	}
 
-	return m, nil
+	// Only cache a complete map; a partial one (plex.tv down) is retried on
+	// the next call.
+	if err == nil {
+		c.users = m
+		c.usersBuilt = time.Now()
+	}
+	return copyUserMap(m), nil
 }
