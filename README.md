@@ -50,7 +50,6 @@ Every delete advances a savings counter and writes an audit row explaining why, 
 
 - **Backend** — Go (`cmd/rollarr`, `internal/`), SQLite, serial job queue so all Sonarr/Plex work is race-free.
 - **Frontend** — React + Vite, embedded into the Go binary.
-- **Shared types** — TypeScript types in `shared/` (frontend only).
 
 ## Quick start
 

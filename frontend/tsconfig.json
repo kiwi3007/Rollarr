@@ -11,10 +11,7 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "strict": true,
-    "paths": {
-      "@rollarr/shared": ["../shared/src/types.ts"]
-    }
+    "strict": true
   },
   "include": ["src"]
 }
