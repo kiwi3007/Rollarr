@@ -254,3 +254,59 @@ func TestMonitorFilterUsesBulkEpisodeLookup(t *testing.T) {
 		t.Fatalf("bulk lookup calls = %d, want 1", calls)
 	}
 }
+
+// newUntrackedInterceptor has no show row for Sonarr series 275 (tvdb 70851),
+// optionally with a pending Seerr request for it.
+func newUntrackedInterceptor(t *testing.T, pendingRequestFrom string) *Interceptor {
+	t.Helper()
+	database, err := db.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { database.Close() })
+	if err := db.RunMigrations(database); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	settings := repository.NewSettingsRepository(database)
+	shows := repository.NewShowRepository(database, settings)
+	requests := repository.NewUserRequestRepository(database)
+	if pendingRequestFrom != "" {
+		if err := requests.Upsert(repository.UserRequest{
+			PlexUserID: pendingRequestFrom, TVDBId: 70851, RequestedSeason: 1,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return NewInterceptor(stubEpisodes{}, shows, requests, settings, stubExpectedState{})
+}
+
+func seriesSearch(t *testing.T, ic *Interceptor) (passedThrough bool, name string) {
+	t.Helper()
+	req := httptest.NewRequest("POST", "/api/v3/command", strings.NewReader(`{"name":"SeriesSearch","seriesId":275}`))
+	rewritten, handled := ic.InterceptSearch(httptest.NewRecorder(), req)
+	if handled {
+		return false, ""
+	}
+	var got commandBody
+	if err := json.NewDecoder(rewritten.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	return true, got.Name
+}
+
+// A series Rollarr doesn't track (e.g. added straight to Sonarr) is searched
+// exactly as asked.
+func TestSearchOnUntrackedSeriesPassesThrough(t *testing.T) {
+	passed, name := seriesSearch(t, newUntrackedInterceptor(t, ""))
+	if !passed || name != "SeriesSearch" {
+		t.Fatalf("passed=%v name=%q, want the original SeriesSearch passed through", passed, name)
+	}
+}
+
+// Between a Seerr request and onboarding there is no show row yet; the search
+// must still be held back, or the whole series would download.
+func TestSearchDuringOnboardingIsAbsorbed(t *testing.T) {
+	if passed, _ := seriesSearch(t, newUntrackedInterceptor(t, "10")); passed {
+		t.Fatal("search for a series with a pending managed request passed through")
+	}
+}

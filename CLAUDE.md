@@ -20,7 +20,7 @@ go vet ./...
 # Frontend dev server (Vite)
 npm run dev
 
-# Frontend production build (shared types first, then frontend)
+# Frontend production build
 npm run build
 ```
 
@@ -30,7 +30,7 @@ Deploy: push to GitHub → CI builds `ghcr.io/kiwi3007/rollarr` → pulled by th
 
 ## Architecture
 
-Go backend (`cmd/rollarr`, `internal/`), React+Vite frontend (`frontend/`, embedded into the binary via `assets.go`), shared TS types (`shared/`) for the frontend only.
+Go backend (`cmd/rollarr`, `internal/`), React+Vite frontend (`frontend/`, embedded into the binary via `assets.go`). Frontend API types live in `frontend/src/api/client.ts`.
 
 ```
 cmd/rollarr/main.go    — wiring: DB, repos, clients, engine, reconciler, scheduler, proxy, router

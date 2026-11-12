@@ -2,7 +2,6 @@
 set -e
 
 echo "Building frontend..."
-npm run build -w shared
 npm run build -w frontend
 
 echo "Compiling Go binary (linux/amd64)..."
