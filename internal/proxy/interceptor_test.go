@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"reflect"
 	"strings"
@@ -196,5 +197,60 @@ func TestSearchOnUnmanagedShowPassesThrough(t *testing.T) {
 	}
 	if got.Name != "SeriesSearch" || got.SeriesId != 275 {
 		t.Errorf("command rewritten to %+v, want unchanged SeriesSearch", got)
+	}
+}
+
+// bulkOnlyEpisodes resolves episode IDs via the bulk endpoint; the
+// all-series scan fails, proving it isn't used.
+type bulkOnlyEpisodes struct {
+	stubEpisodes
+	bulkCalls *int
+}
+
+func (s bulkOnlyEpisodes) GetSeries() ([]sonarr.Series, error) {
+	return nil, errScanUsed
+}
+
+func (s bulkOnlyEpisodes) GetEpisodesByIDs(ids []int) ([]sonarr.Episode, error) {
+	*s.bulkCalls++
+	want := map[int]bool{}
+	for _, id := range ids {
+		want[id] = true
+	}
+	var out []sonarr.Episode
+	for _, ep := range s.episodes {
+		if want[ep.ID] {
+			out = append(out, ep)
+		}
+	}
+	return out, nil
+}
+
+var errScanUsed = errors.New("all-series scan used")
+
+func TestMonitorFilterUsesBulkEpisodeLookup(t *testing.T) {
+	episodes := []sonarr.Episode{
+		{ID: 20, SeriesId: 275, SeasonNumber: 2, EpisodeNumber: 1},
+		{ID: 21, SeriesId: 275, SeasonNumber: 2, EpisodeNumber: 2},
+		{ID: 22, SeriesId: 275, SeasonNumber: 2, EpisodeNumber: 3},
+	}
+	interceptor := newManagedInterceptor(t, nil, state.ExpectedState{2: {1, 2}})
+	calls := 0
+	interceptor.sonarr = bulkOnlyEpisodes{stubEpisodes: stubEpisodes{episodes: episodes}, bulkCalls: &calls}
+
+	req := httptest.NewRequest("PUT", "/api/v3/episode/monitor", strings.NewReader(`{"episodeIds":[20,21,22],"monitored":true}`))
+	rewritten, handled := interceptor.InterceptMonitor(httptest.NewRecorder(), req)
+	if handled {
+		t.Fatal("monitor request unexpectedly handled")
+	}
+	var got monitorBody
+	if err := json.NewDecoder(rewritten.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if want := []int{20, 21}; !reflect.DeepEqual(got.EpisodeIds, want) {
+		t.Fatalf("episodeIds = %v, want %v", got.EpisodeIds, want)
+	}
+	if calls != 1 {
+		t.Fatalf("bulk lookup calls = %d, want 1", calls)
 	}
 }

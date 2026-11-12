@@ -30,7 +30,9 @@ type intRange struct{ min, max int }
 // writableSettings is the allowlist for PUT /api/settings. Anything else in
 // the table (schema_version, stat_* counters) is internal: the UI posts back
 // the whole map it loaded, and writing those stale values would rewind them.
-// A nil range means a free-form string.
+// A nil range means a free-form string. rollarr_api_token is deliberately not
+// writable: it is read once at startup (a change would silently not apply),
+// and blanking it would turn API auth off. Set ROLLARR_API_TOKEN instead.
 var writableSettings = map[string]*intRange{
 	"sonarr_url":                  nil,
 	"sonarr_api_key":              nil,
@@ -39,7 +41,6 @@ var writableSettings = map[string]*intRange{
 	"plex_db_path":                nil,
 	"seerr_webhook_secret":        nil,
 	"plex_webhook_secret":         nil,
-	"rollarr_api_token":           nil,
 	"excluded_user_ids":           nil,
 	"global_buffer_size":          {1, 100},
 	"global_inactivity_days":      {1, 3650},

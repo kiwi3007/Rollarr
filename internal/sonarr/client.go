@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -210,6 +211,23 @@ func (c *Client) GetEpisodes(seriesId int) ([]Episode, error) {
 	path := fmt.Sprintf("/api/v3/episode?seriesId=%d", seriesId)
 	var result []Episode
 	if err := c.get(path, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetEpisodesByIDs returns the episodes with the given IDs, across series,
+// in one request.
+func (c *Client) GetEpisodesByIDs(ids []int) ([]Episode, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	q := url.Values{}
+	for _, id := range ids {
+		q.Add("episodeIds", strconv.Itoa(id))
+	}
+	var result []Episode
+	if err := c.get("/api/v3/episode?"+q.Encode(), &result); err != nil {
 		return nil, err
 	}
 	return result, nil

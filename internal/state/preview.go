@@ -71,7 +71,10 @@ func (e *Engine) PreviewWithKey(tvdbId, sonarrId int, showKey string, bufferSize
 
 	reqs := e.previewRequests(tvdbId, showKey, manual)
 
-	perUserHighest, perUserViewed := e.gatherHighest(showKey, tvdbId, reqs)
+	perUserHighest, perUserViewed, err := e.gatherHighest(showKey, tvdbId, reqs)
+	if err != nil {
+		return PreviewResult{}, fmt.Errorf("state.Preview(%d): %w", tvdbId, err)
+	}
 
 	allEpisodes := make(map[int][]int)
 	for _, ref := range lay.linear {

@@ -17,17 +17,17 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
   {
     title: 'Sonarr',
     fields: [
-      { key: 'sonarr_url',     label: 'Sonarr URL',  placeholder: 'http://sonarr:8989', type: 'text' },
-      { key: 'sonarr_api_key', label: 'API Key',      type: 'password' },
+      { key: 'sonarr_url',     label: 'Sonarr URL',  placeholder: 'http://sonarr:8989', type: 'text', hint: 'Restart Rollarr to apply a change' },
+      { key: 'sonarr_api_key', label: 'API Key',      type: 'password', hint: 'Restart Rollarr to apply a change' },
     ],
   },
   {
     title: 'Plex',
     fields: [
-      { key: 'plex_url',     label: 'Plex URL',            placeholder: 'http://plex:32400', type: 'text' },
-      { key: 'plex_token',   label: 'Plex Token',          type: 'password', hint: 'Admin token — covers all user types' },
+      { key: 'plex_url',     label: 'Plex URL',            placeholder: 'http://plex:32400', type: 'text', hint: 'Restart Rollarr to apply a change' },
+      { key: 'plex_token',   label: 'Plex Token',          type: 'password', hint: 'Admin token — covers all user types. Restart Rollarr to apply a change.' },
       { key: 'plex_db_path', label: 'Plex Database Path',  placeholder: '/var/lib/plexmediaserver/…', type: 'text',
-        hint: 'Optional: path to Plex SQLite DB. Enables "Mark as Watched" tracking.' },
+        hint: 'Optional: path to Plex SQLite DB. Enables "Mark as Watched" tracking. Restart Rollarr to apply a change.' },
     ],
   },
   {
@@ -35,6 +35,8 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
     fields: [
       { key: 'seerr_webhook_secret', label: 'Seerr Webhook Secret', type: 'password',
         hint: 'Set this in Seerr → Notifications → Webhook → Custom header: x-webhook-secret' },
+      { key: 'plex_webhook_secret', label: 'Plex Webhook Secret', type: 'password',
+        hint: 'Plex can’t send headers: add it to the webhook URL in Plex → Settings → Webhooks, e.g. …/webhooks/plex?secret=YOUR_SECRET' },
     ],
   },
   {
@@ -48,7 +50,7 @@ const FIELD_GROUPS: Array<{ title: string; fields: Field[] }> = [
   },
 ];
 
-const SECRET_KEYS = new Set(['sonarr_api_key', 'plex_token', 'seerr_webhook_secret']);
+const SECRET_KEYS = new Set(['sonarr_api_key', 'plex_token', 'seerr_webhook_secret', 'plex_webhook_secret']);
 
 export function Settings() {
   const [values, setValues] = useState<SettingsMap>({});
