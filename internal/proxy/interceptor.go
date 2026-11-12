@@ -102,10 +102,61 @@ func (i *Interceptor) managedShow(sonarrSeriesId int) *repository.Show {
 	return show
 }
 
-// isUnmanaged reports whether the series is tracked by Rollarr but unmanaged.
-func (i *Interceptor) isUnmanaged(sonarrSeriesId int) bool {
+// searchScope says how a series-wide search for this Sonarr series is
+// handled.
+type searchScope string
+
+const (
+	scopeManaged    searchScope = "managed"    // scope to the window
+	scopeOnboarding searchScope = "onboarding" // managed request, show row not yet written
+	scopeUnmanaged  searchScope = "unmanaged"  // tracked, requested only by excluded users
+	scopeUntracked  searchScope = "untracked"  // not Rollarr's show
+)
+
+// searchScope classifies a Sonarr series for search interception. A series
+// with no show row is normally not Rollarr's — but between a Seerr request
+// (webhook writes the user_request) and onboarding (show row written after
+// Sonarr indexes the series) it is, so a managed pending request counts as
+// onboarding. If Sonarr can't be asked which show it is, treat it as
+// onboarding: swallowing a search is recoverable, a full-series download is
+// not.
+func (i *Interceptor) searchScope(sonarrSeriesId int) searchScope {
 	show, err := i.shows.FindBySonarrId(sonarrSeriesId)
-	return err == nil && show != nil && show.Unmanaged
+	if err == nil && show != nil {
+		if show.Unmanaged {
+			return scopeUnmanaged
+		}
+		return scopeManaged
+	}
+
+	all, err := i.sonarr.GetSeries()
+	if err != nil {
+		log.Printf("[proxy] searchScope seriesId=%d: sonarr series lookup failed, treating as onboarding: %v", sonarrSeriesId, err)
+		return scopeOnboarding
+	}
+	tvdbId := 0
+	for _, series := range all {
+		if series.ID == sonarrSeriesId {
+			tvdbId = series.TvdbId
+			break
+		}
+	}
+	if tvdbId == 0 || i.requests == nil {
+		return scopeUntracked
+	}
+	reqs, err := i.requests.FindByShow(tvdbId)
+	if err != nil {
+		log.Printf("[proxy] searchScope tvdb=%d: load requests failed, treating as onboarding: %v", tvdbId, err)
+		return scopeOnboarding
+	}
+	excluded := map[string]bool{}
+	if i.settings != nil {
+		excluded = i.settings.ExcludedUsers()
+	}
+	if len(reqs) > 0 && repository.ShouldManage(reqs, excluded) {
+		return scopeOnboarding
+	}
+	return scopeUntracked
 }
 
 // InterceptSeriesUpdate handles PUT /api/v3/series/{id}. Seerr updates an
@@ -357,14 +408,23 @@ func (i *Interceptor) InterceptSearch(w http.ResponseWriter, r *http.Request) (*
 		return rewritten, false
 
 	case "SeriesSearch", "SeasonSearch", "MissingEpisodeSearch", "CutoffUnmetEpisodeSearch":
-		if body.SeriesId == 0 || i.isUnmanaged(body.SeriesId) {
+		if body.SeriesId == 0 {
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			return r, false
+		}
+		switch scope := i.searchScope(body.SeriesId); scope {
+		case scopeUnmanaged, scopeUntracked:
+			// Not Rollarr's show: Sonarr searches it as asked.
+			log.Printf("[proxy] %s seriesId=%d passed through: %s", body.Name, body.SeriesId, scope)
 			r.Body = io.NopCloser(bytes.NewReader(raw))
 			return r, false
 		}
 		missingOnly := body.Name == "MissingEpisodeSearch"
 		windowIds, err := i.windowEpisodeIds(body.SeriesId, body.SeasonNumber, missingOnly)
 		if err != nil || len(windowIds) == 0 {
-			log.Printf("[proxy] %s seriesId=%d absorbed: show not managed or window empty (err=%v)", body.Name, body.SeriesId, err)
+			// Managed (or being onboarded) with nothing in the window to
+			// search: swallow it rather than let Sonarr search everything.
+			log.Printf("[proxy] %s seriesId=%d absorbed: managed show, window empty or not ready (err=%v)", body.Name, body.SeriesId, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusAccepted)
 			w.Write([]byte(`{"id":0,"status":"queued","name":"EpisodeSearch"}`)) //nolint:errcheck
