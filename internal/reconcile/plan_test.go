@@ -99,3 +99,60 @@ func TestPlanSeerrResolution(t *testing.T) {
 		t.Fatalf("deletes = %v, want %v (dave must be kept)", deletes, want)
 	}
 }
+
+const matchedByIDMsg = "Found matching series via grab history, but release was matched to series by ID. Automatic import is not possible. See the FAQ for details."
+
+func queueRec(id, seriesID, episodeID int, downloadID, state, msg string) sonarr.QueueRecord {
+	rec := sonarr.QueueRecord{
+		ID: id, SeriesID: seriesID, EpisodeID: episodeID,
+		DownloadID: downloadID, Title: downloadID, TrackedDownloadState: state,
+	}
+	if msg != "" {
+		rec.StatusMessages = []sonarr.QueueStatusMessage{{Title: downloadID, Messages: []string{msg}}}
+	}
+	return rec
+}
+
+func TestPlanWrongGrabsSelectsBlockedInWindowOnly(t *testing.T) {
+	queue := []sonarr.QueueRecord{
+		// US Ghosts grabbed for BBC Ghosts (series 299): in window → removed.
+		queueRec(1, 299, 18109, "us-s04e01", "importBlocked", matchedByIDMsg),
+		// Same series, blocked for a different reason (executable) → left.
+		queueRec(2, 299, 18110, "exe", "importBlocked", "Caution: Found executable file with extension: '.exe'"),
+		// Same series, downloading normally → left.
+		queueRec(3, 299, 18111, "ok", "downloading", ""),
+		// Blocked wrong grab but outside every window → left.
+		queueRec(4, 299, 18120, "out-of-window", "importBlocked", matchedByIDMsg),
+		// Another series' wrong grab (Archie for Archer) → not this show's.
+		queueRec(5, 290, 17169, "archie", "importBlocked", matchedByIDMsg),
+	}
+	inWindow := map[int]bool{18109: true, 18110: true, 18111: true, 17169: true}
+
+	got := planWrongGrabs(queue, 299, inWindow)
+	if len(got) != 1 || got[0].queueID != 1 || !reflect.DeepEqual(got[0].episodeIDs, []int{18109}) {
+		t.Fatalf("got %+v, want only queue record 1 for episode 18109", got)
+	}
+}
+
+func TestPlanWrongGrabsCollapsesMultiEpisodeDownload(t *testing.T) {
+	// A season pack appears once per episode; it must be removed once and
+	// free every episode it was holding, even those outside the window.
+	queue := []sonarr.QueueRecord{
+		queueRec(10, 299, 3, "pack", "importBlocked", matchedByIDMsg),
+		queueRec(11, 299, 1, "pack", "importBlocked", matchedByIDMsg),
+		queueRec(12, 299, 2, "pack", "importBlocked", matchedByIDMsg),
+	}
+	got := planWrongGrabs(queue, 299, map[int]bool{2: true})
+	if len(got) != 1 {
+		t.Fatalf("got %d grabs, want 1", len(got))
+	}
+	if got[0].queueID != 10 || !reflect.DeepEqual(got[0].episodeIDs, []int{1, 2, 3}) {
+		t.Fatalf("got %+v, want queue 10 covering episodes [1 2 3]", got[0])
+	}
+}
+
+func TestPlanWrongGrabsEmptyQueue(t *testing.T) {
+	if got := planWrongGrabs(nil, 299, map[int]bool{1: true}); len(got) != 0 {
+		t.Fatalf("empty queue (e.g. Sonarr queue error) must plan nothing, got %+v", got)
+	}
+}

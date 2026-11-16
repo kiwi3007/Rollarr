@@ -8,6 +8,7 @@ import type { ShowDetail as ShowDetailType, UserRequest, Flag, ShowEvent } from 
 const EVENT_COLORS: Record<string, string> = {
   deleted:     '#f87171',
   searched:    'var(--color-accent-orange)',
+  blocklisted: '#f87171',
   discovered:  '#a78bfa',
   onboarded:   'var(--color-accent-green)',
   reactivated: 'var(--color-accent-green)',
