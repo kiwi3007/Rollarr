@@ -277,24 +277,60 @@ func (c *Client) DeleteEpisodeFile(fileId int) error {
 	return c.delete(path)
 }
 
-// GetQueuedEpisodeIDs returns the set of episode IDs currently in the Sonarr
-// download queue (grabbed, downloading, or importing). Episodes in this set
-// should not be re-searched.
-func (c *Client) GetQueuedEpisodeIDs() (map[int]bool, error) {
+// QueueStatusMessage is one entry in a queue record's statusMessages array.
+type QueueStatusMessage struct {
+	Title    string   `json:"title"`
+	Messages []string `json:"messages"`
+}
+
+// QueueRecord is one Sonarr download-queue record. A download covering several
+// episodes (season pack, multi-episode file) appears once per episode, all
+// sharing the same DownloadID.
+type QueueRecord struct {
+	ID                   int                  `json:"id"`
+	SeriesID             int                  `json:"seriesId"`
+	EpisodeID            int                  `json:"episodeId"`
+	DownloadID           string               `json:"downloadId"`
+	Title                string               `json:"title"`
+	TrackedDownloadState string               `json:"trackedDownloadState"`
+	EpisodeHasFile       bool                 `json:"episodeHasFile"`
+	StatusMessages       []QueueStatusMessage `json:"statusMessages"`
+}
+
+// GetQueue returns every record in the Sonarr download queue (grabbed,
+// downloading, importing, or stuck waiting for a manual import).
+func (c *Client) GetQueue() ([]QueueRecord, error) {
 	var wrapper struct {
-		Records []struct {
-			EpisodeID int `json:"episodeId"`
-		} `json:"records"`
+		Records []QueueRecord `json:"records"`
 	}
 	queueURL := "/api/v3/queue?" + url.Values{"pageSize": {"1000"}}.Encode()
 	if err := c.get(queueURL, &wrapper); err != nil {
 		return nil, err
 	}
-	ids := make(map[int]bool, len(wrapper.Records))
-	for _, r := range wrapper.Records {
+	return wrapper.Records, nil
+}
+
+// QueuedEpisodeIDs returns the set of episode IDs present in the queue.
+// Episodes in this set should not be re-searched.
+func QueuedEpisodeIDs(records []QueueRecord) map[int]bool {
+	ids := make(map[int]bool, len(records))
+	for _, r := range records {
 		if r.EpisodeID > 0 {
 			ids[r.EpisodeID] = true
 		}
 	}
-	return ids, nil
+	return ids
+}
+
+// RemoveAndBlocklist removes a queue record's download from the download
+// client and adds the release to Sonarr's blocklist, so the next search picks
+// a different release. skipRedownload is set because Rollarr runs its own
+// search for in-window episodes straight afterwards.
+func (c *Client) RemoveAndBlocklist(queueID int) error {
+	q := url.Values{
+		"removeFromClient": {"true"},
+		"blocklist":        {"true"},
+		"skipRedownload":   {"true"},
+	}
+	return c.delete(fmt.Sprintf("/api/v3/queue/%d?%s", queueID, q.Encode()))
 }

@@ -243,10 +243,35 @@ func (r *Reconciler) ReconcileShow(tvdbId int) error {
 	}
 
 	// 4. Compute missing: expected, no file, not queued.
-	queuedIDs, err := r.sonarr.GetQueuedEpisodeIDs()
+	queue, err := r.sonarr.GetQueue()
 	if err != nil {
 		log.Printf("[reconcile] tvdb=%d get queue: %v (skipping queue check)", tvdbId, err)
-		queuedIDs = map[int]bool{}
+	}
+	queuedIDs := sonarr.QueuedEpisodeIDs(queue)
+
+	// 4a. Drop wrong-show grabs. Sonarr blocks the import of a release that
+	// matched this series only by indexer ID (e.g. US "Ghosts" grabbed for the
+	// BBC one). Left alone it sits in the queue forever, and because its
+	// episodes count as queued they are never searched again. Remove it from
+	// the download client, blocklist the release, and free its episodes so the
+	// search below picks a different release this same cycle.
+	inWindowIDs := make(map[int]bool, len(expectedSet))
+	for k := range expectedSet {
+		if info, ok := episodesByKey[k]; ok {
+			inWindowIDs[info.id] = true
+		}
+	}
+	for _, g := range planWrongGrabs(queue, show.SonarrId, inWindowIDs) {
+		if err := r.sonarr.RemoveAndBlocklist(g.queueID); err != nil {
+			log.Printf("[reconcile] tvdb=%d blocklist wrong grab %q: %v", tvdbId, g.title, err)
+			continue
+		}
+		log.Printf("[reconcile] tvdb=%d removed and blocklisted wrong grab %q", tvdbId, g.title)
+		r.logEvent(tvdbId, "blocklisted", fmt.Sprintf("%s — Sonarr blocked the import (release matched this show by ID only, likely a different show); removed and searching again", g.title))
+		for _, id := range g.episodeIDs {
+			delete(queuedIDs, id)
+			r.clearSearchBackoff(id)
+		}
 	}
 
 	now := time.Now()

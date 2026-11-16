@@ -1,7 +1,9 @@
 package reconcile
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/kiwi3007/rollarr/internal/sonarr"
 	"github.com/kiwi3007/rollarr/internal/state"
@@ -122,4 +124,76 @@ func planUnmonitor(episodes []sonarr.Episode, expected map[epKey]struct{}, delet
 	}
 	sort.Ints(ids)
 	return ids
+}
+
+// wrongGrabMarker is the text Sonarr puts on a queue record it refuses to
+// import because the release name doesn't match the series: the grab only
+// happened because the indexer tagged it with this series' ID. In practice
+// that means a different show (US vs UK remake, "Archie" grabbed for
+// "Archer"), so the content must not be imported.
+const wrongGrabMarker = "matched to series by id"
+
+// isWrongGrab reports whether a queue record is a download Sonarr blocked as
+// matched-by-ID-only.
+func isWrongGrab(rec sonarr.QueueRecord) bool {
+	if rec.TrackedDownloadState != "importBlocked" {
+		return false
+	}
+	for _, sm := range rec.StatusMessages {
+		for _, m := range sm.Messages {
+			if strings.Contains(strings.ToLower(m), wrongGrabMarker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// wrongGrab is one download to remove and blocklist, and the episodes it was
+// holding in the queue (freed for a fresh search once it is removed).
+type wrongGrab struct {
+	queueID    int
+	downloadID string
+	title      string
+	episodeIDs []int
+}
+
+// planWrongGrabs returns the blocked wrong-show downloads of a series that
+// hold at least one in-window episode. Downloads for episodes outside every
+// window are left alone: Rollarr would not search them again anyway. A
+// download appears once per episode in the queue; it is returned once, with
+// every episode it covers, so it is removed once.
+func planWrongGrabs(records []sonarr.QueueRecord, seriesID int, inWindow map[int]bool) []wrongGrab {
+	byDownload := make(map[string]*wrongGrab)
+	var order []string
+	for _, rec := range records {
+		if rec.SeriesID != seriesID || !isWrongGrab(rec) {
+			continue
+		}
+		key := rec.DownloadID
+		if key == "" {
+			key = fmt.Sprintf("queue:%d", rec.ID)
+		}
+		g, ok := byDownload[key]
+		if !ok {
+			g = &wrongGrab{queueID: rec.ID, downloadID: rec.DownloadID, title: rec.Title}
+			byDownload[key] = g
+			order = append(order, key)
+		}
+		if rec.EpisodeID > 0 {
+			g.episodeIDs = append(g.episodeIDs, rec.EpisodeID)
+		}
+	}
+	var out []wrongGrab
+	for _, key := range order {
+		g := byDownload[key]
+		for _, id := range g.episodeIDs {
+			if inWindow[id] {
+				sort.Ints(g.episodeIDs)
+				out = append(out, *g)
+				break
+			}
+		}
+	}
+	return out
 }
